@@ -1,0 +1,360 @@
+# Atlas Phase 4 - Andromeda Cortex Integration
+#
+# Built on Phase 3 baseline (true EM ~38%, peaks at 100% for 188 batches) with:
+#   ✅ Andromeda Cortex (+20-35pp EM expected)
+#   ✅ EM averaging fix (accurate metrics)
+#   ✅ All Phase 3 fixes (HRM adaptive, wormhole, spike coding)
+#
+# Philosophy:
+#   - SUSTAIN peak performance (model CAN achieve 100% EM, just can't sustain it)
+#   - Cortex predictive coding learns sparse abstractions
+#   - Conservative cortex weights (start 0.5× to avoid Phase 2 aux spike)
+#   - Goal: Sustained 100% EM across all 1000 batches/epoch
+#
+# Expected trajectory (with cortex):
+#   Epoch 10:  EM=45-50%  (cortex learning, may spike aux losses)
+#   Epoch 20:  EM=55-65%  (cortex + wormhole synergy)
+#   Epoch 40:  EM=70-80%  (sparse codes mature)
+#   Epoch 60:  EM=75-85%  (approaching sustained 100%)
+#   Epoch 100: EM=80-90%  (sustained high performance)
+#   Epoch 150: EM=85-95%  (full convergence)
+#
+# Usage:
+#   python train_parent.py --config configs/atlas_andromeda.yaml
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Core Training Settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+training:
+  seed: 1338  # Different from Phase 3 (1337) for fresh initialization
+  batch_size: 16
+  epochs: 150
+  optimizer: adamw
+  lr: 4.0e-4  # AGGRESSIVE: Higher LR (was 3e-4)
+  weight_decay: 0.03  # AGGRESSIVE: Lower weight decay for more learning (was 0.05)
+  max_grad_norm: 1.5  # AGGRESSIVE: Allow larger gradients (was 1.0)
+  amp: true
+  max_steps: 100000
+
+dataset: arc2  # ARC-AGI-2
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Andromeda Cortex (NEW - Predictive Coding MoE Layer)
+# ═══════════════════════════════════════════════════════════════════════════
+# Neuroscience-inspired predictive coding with sparse gating
+# Provides: residual enrichment + DSL op_bias + EBR prior scales
+
+cortex:
+  enable_cortex: true  # Enable Andromeda Cortical Sheet
+  columns: 12  # AGGRESSIVE: More experts (was 8) - √12 ≈ 3.5 active
+  column_dim: 384  # AGGRESSIVE: Larger columns (was 256)
+  depth: 3  # AGGRESSIVE: Deeper hierarchy (was 2)
+  gating_temp: 0.5  # AGGRESSIVE: Sparser gating (was 0.7)
+  prior_scale_max: 2.0  # AGGRESSIVE: Wider EBR scaling [0.5, 2.0] (was 1.5)
+
+  # Loss weights (AGGRESSIVE - push cortex to contribute more)
+  lambda_recon: 0.8  # AGGRESSIVE: Higher reconstruction (was 0.5)
+  lambda_entropy: 0.7  # AGGRESSIVE: Stronger entropy push (was 0.5)
+  lambda_sparsity: 0.4  # AGGRESSIVE: Stronger sparsity (was 0.25)
+
+  # Aux loss cap (relaxed for aggressive training)
+  max_aux_ratio: 0.15  # AGGRESSIVE: Allow 15% (was 10%)
+
+  # Cortex integration with search and refinement
+  use_in_ebr: true  # Wire Cortex prior scales to EBR energy terms
+  use_in_puct: false  # Wire Cortex op_bias to PUCT (disabled for conservative start)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SynergyFusion: Cortex + RelMem + BrainGraph Unified Priors
+# ═══════════════════════════════════════════════════════════════════════════
+# Fuses three sources of knowledge into gradient-carrying priors:
+#   - Cortex: Predictive coding residuals (φ, κ, CGE scales)
+#   - RelMem: Episodic concept embeddings + operation biases
+#   - BrainGraph: Structural task embeddings (reversible knowledge graph)
+#
+# Outputs:
+#   - op_prior_logits: DSL operation priors for search
+#   - resid_nudge: Brain latent enrichment vector
+#
+# Architecture: Trust-gated blending with reparameterization trick for
+# confidence-weighted gradients (precision-weighted prediction errors).
+#
+# Expected impact: +5-10pp EM from neurosymbolic prior fusion
+# Param cost: +2-3M params (SynergyFusion module)
+
+# SynergyFusion flat config (AGGRESSIVE settings)
+synergy_fusion_enabled: true  # ⚡ MASTER KILL SWITCH ⚡
+synergy_fusion_trust_temp: 1.2  # AGGRESSIVE: Higher exploration
+synergy_fusion_lambda_kl: 1.5  # AGGRESSIVE: Stronger KL convergence
+synergy_fusion_resid_weight: 0.3  # AGGRESSIVE: Stronger brain nudging
+synergy_fusion_op_prior_weight: 0.6  # AGGRESSIVE: Stronger prior fusion
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Dopamine Replay (From Phase 3, Proven)
+# ═══════════════════════════════════════════════════════════════════════════
+
+replay:
+  enabled: true
+  buffer_size: 600  # AGGRESSIVE: 3x baseline (was 400)
+  topk_pixels: 250  # AGGRESSIVE: More hard pixels (was 150)
+  lambda_start: 0.08  # AGGRESSIVE: Start higher (was 0.05)
+  lambda_ramp_per_100_steps: 0.005  # AGGRESSIVE: Faster ramp (was 0.003)
+  lambda_max: 1.0  # AGGRESSIVE: Higher max (was 0.8)
+  lambda_delay_steps: 0
+  micro_every: 20  # AGGRESSIVE: More frequent micro-steps (was 25)
+  micro_k: 3  # AGGRESSIVE: 3x baseline (was 2)
+  micro_lambda: 0.65  # AGGRESSIVE: Higher LR multiplier (was 0.55)
+  stagnation_patience: 150  # AGGRESSIVE: Earlier intervention (was 200)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RelationalMemory (Increased for Templates)
+# ═══════════════════════════════════════════════════════════════════════════
+
+relmem:
+  strict: true
+  inverse_weight: 0.015  # AGGRESSIVE: Higher inverse constraint (was 0.01)
+  op_bias_scale: 1.5  # AGGRESSIVE: Stronger op biasing (was 1.0)
+  max_concepts: 4096  # AGGRESSIVE: Even more concepts (was 3072)
+  bind_iou: 0.15  # AGGRESSIVE: Lower threshold for more binding (was 0.20)
+  wta_frac: 0.15  # AGGRESSIVE: More winners (was 0.12)
+  hebbian_eta: 0.12  # AGGRESSIVE: Stronger Hebbian (was 0.08)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auxiliary Losses (Phase 3 Proven Safe)
+# ═══════════════════════════════════════════════════════════════════════════
+
+contrastive:
+  enabled: true
+  margin: 0.6  # AGGRESSIVE: Wider margin (was 0.5)
+  lambda: 0.35  # AGGRESSIVE: Higher weight (was 0.25)
+
+demo_consistency:
+  enabled: true
+  lambda: 0.02
+
+dream_kl:
+  enabled: true
+  lambda_min: 0.1
+  lambda_max: 1.0
+  eps_start: 0.01
+  eps_min: 0.001
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DreamEngine (From Phase 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+dream:
+  enable_dream: true
+  micro_ticks: 2  # AGGRESSIVE: 2x micro-ticks (was 1)
+  ripple_rate_hz: 1.0  # AGGRESSIVE: Higher ripple rate (was 0.8)
+  stdp_gain: 4.0  # AGGRESSIVE: Stronger STDP (was 3.0)
+  wall_time_s: 3.0  # AGGRESSIVE: More dream time (was 2.0)
+
+  # Dream pretrain (warm-up hierarchical + dream)
+  pretrain_epochs: 2  # 2 epochs (default, overridden by phased_training.dream_pretrain_epochs if enabled)
+  pretrain_batches: 300  # AGGRESSIVE: More batches (was 200)
+  pretrain_freeze_model: true
+  full_every: 3  # AGGRESSIVE: More frequent consolidation (was 4)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phased Training (WGO Oracle Learning Pipeline)
+# ═══════════════════════════════════════════════════════════════════════════
+# Three-phase training for learned WGO (World Graph Oracle):
+#   Phase 0: Dream pretrain (optional, 2 epochs)
+#   Phase 1: Encoder warmup (simple forward, 2 epochs)
+#   Phase 2: WGO supervised learning on synthetic tasks (3 epochs)
+#   Phase 3: Joint training with learned WGO oracle (main training)
+#
+# Usage:
+#   python train_parent.py --config configs/atlas_andromeda.yaml --training-phases 1,2,3
+
+phased_training:
+  # Enable phased training (set via --training-phases CLI arg)
+  enabled: false  # Set to true via --training-phases 1,2,3
+  training_phases: [1, 2, 3]  # Which phases to run (can override via CLI)
+
+  # Phase 0: Dream pretrain (optional warm-start)
+  dream_pretrain_epochs: 2  # Dream-only warmup before Phase 1
+  dream_pretrain_batches: 300  # AGGRESSIVE: More batches for dream warmup
+
+  # Phase 1: Encoder warmup (simple forward, CE loss only)
+  phase1_epochs: 2  # Encoder foundation training
+
+  # Phase 2: WGO supervised learning (AGGRESSIVE settings)
+  phase2_epochs: 2  # WGO head training on synthetic tasks
+  phase2_synthetic_count: 15000  # AGGRESSIVE: More synthetic tasks (was 12000)
+  phase2_batch_size: 8  # Batch size for Phase 2
+  phase2_val_split: 0.2  # Validation split for WGO training
+
+  # Phase 3: Joint training (uses main training config)
+  # phase3_epochs is set by training.epochs (main training loop)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Orbit-CEGIS
+# ═══════════════════════════════════════════════════════════════════════════
+
+orbit_cegis:
+  use_orbit_canon: true
+  orbit_loss_weight: 0.03
+  certificates: hard
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PUCT Search (Inference Only)
+# ═══════════════════════════════════════════════════════════════════════════
+
+puct:
+  enabled: true
+  use_puct_eval: true  # Enable PUCT in evaluation pipeline
+  sims: 1000
+  max_depth: 6
+  c_puct: 1.25
+
+pretraining:
+  use_dsl: false  # NO DSL during training (purity)
+  label_smoothing: 0.05
+  use_ebr: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Refinement Loop (Stage-6)
+# ═══════════════════════════════════════════════════════════════════════════
+
+refine:
+  iters: 7  # AGGRESSIVE: More refinement iterations (was 5)
+  depth: 8  # AGGRESSIVE: Deeper search (was 6)
+  simulations: 3000  # AGGRESSIVE: More PUCT sims (was 2000)
+  c_puct: 1.8  # AGGRESSIVE: More exploration (was 1.5)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Alpha-ARC & Extended Settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+alpha_evolve: true
+alpha_dsl_enable: true
+alpha_dsl_sims: 600  # AGGRESSIVE: More DSL sims (was 400)
+alpha_dsl_max_depth: 12  # AGGRESSIVE: Deeper DSL search (was 10)
+
+beam: 32  # AGGRESSIVE: Wider beam (was 24)
+
+hyla_max_depth: 6  # AGGRESSIVE: Deeper HyLa (was 4)
+hyla_beam_width: 64  # AGGRESSIVE: Wider HyLa beam (was 50)
+
+enable_market: true
+market_liquidity: 30.0  # AGGRESSIVE: Deeper market (was 20.0)
+
+self_play_enable: true
+self_play_games: 6  # AGGRESSIVE: More self-play (was 4)
+
+ttt_enable: true
+ttt_steps: 5  # AGGRESSIVE: More TTT adaptation (was 2)
+ttt_lr: 0.002  # AGGRESSIVE: Higher TTT LR (was 0.001)
+
+use_ebr: true
+ebr_iters: 7  # AGGRESSIVE: More EBR iterations (was 5)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Other Settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+mdl:
+  penalty: 0.02
+
+spike:
+  spike_alpha_max: 0.5
+  lambda_spike_pretrain: 0.0
+  spike_k_ebr: 1
+  lambda_spike_ebr: 0.03
+
+selfplay:
+  enable: false
+
+curriculum:
+  enabled: false
+
+nightmare:
+  alpha: 0.08
+  min_interval: 200
+  max_interval: 1000
+
+hyla:
+  max_hyp: 32
+  enable_warm_start: true
+
+market:
+  liquidity: 25.0
+  op_bias_w: 0.60
+
+logging:
+  step_interval: 50
+  eval_interval: 5
+  metrics:
+    - loss_ce
+    - dopamine_replay
+    - contrastive_projection
+    - dream_op_kl
+    - dream_feat_align
+    - demo_consistency
+    - relmem_inverse
+    - exact_match
+    - accuracy
+    - mean_iou
+    - cortex_pc_recon
+    - cortex_pc_entropy
+    - cortex_kl_sparsity
+
+model:
+  width: 512
+  slots: 64
+
+  # Hierarchical Abstraction (multi-level pattern extraction for generalization)
+  use_hierarchical_abstraction: true  # Enable 4-level hierarchy with learnable gating
+
+  # Inference-time monologue (already present in winner config)
+  use_inference_monologue: true
+  monologue_k: 8
+  monologue_temp: 0.7
+
+  # Uni-hemispheric dreaming at inference
+  uhd_preticks: 12
+  uhd_retrieval_w: 0.6
+
+  # Critic head
+  use_critic_head: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 4 Strategy & Monitoring
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Phase 3 Results:
+#   - True avg EM: ~38% (reported was wrong due to averaging bug)
+#   - Peak EM: 100% sustained for 188 batches (Epoch 134, batches 136-323)
+#   - BrainGraph: 26 concepts by Epoch 150
+#   - CIO meta-learner: Converged ripple_rate=0.8Hz, stdp_gain=3.0
+#
+# Phase 4 Goal:
+#   NOT "improve from 38% to 85%"
+#   BUT "sustain 100% EM from batch 0 through batch 1000"
+#
+# Cortex Role:
+#   - Predictive coding learns sparse, phase-stable abstractions
+#   - Enriches brain latent → better concept activation
+#   - Provides DSL op_bias → guides search
+#   - Scales EBR priors → adaptive refinement
+#
+# Expected Cortex Behavior:
+#   Epochs 1-5:   Aux spike to ~20-30% (cortex learning to reconstruct)
+#   Epochs 6-20:  Aux stabilizes to 3-8% (cortex converged)
+#   Epochs 20+:   EM acceleration from sparse abstractions
+#
+# Warning Signs:
+#   - Cortex aux > 15%: Reduce lambda_recon/entropy/sparsity by 0.25
+#   - EM regresses: Disable cortex, analyze logs
+#   - Gate sparsity = 1 or 8: Tune gating_temp
+#
+# Success Metrics:
+#   - Epoch 20: EM > 50% (cortex contributing)
+#   - Epoch 40: EM > 70% (sparse codes mature)
+#   - Epoch 100: EM > 85% (sustained high performance)
+#   - Within-epoch: EM stays >80% from batch 0-1000 (no cold start!)
+#
+# ═══════════════════════════════════════════════════════════════════════════
