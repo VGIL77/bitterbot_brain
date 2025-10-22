@@ -1433,7 +1433,7 @@ def beam_search(demos, test, priors, depth=12, beam=50, use_templates=True, use_
     )
 
 
-def run_dsl_puct(demos, test, op_bias=None, max_depth=2, num_simulations=100, c_puct=1.4, return_rule_info=False, verbose=False, causal_context=None):
+def run_dsl_puct(demos, test, op_bias=None, max_depth=2, num_simulations=100, c_puct=1.4, return_rule_info=False, verbose=False):
     """
     PUCT-only DSL search. No beam fallback.
     Uses Upper Confidence Bound for Trees (PUCT) selection with op_bias as policy priors.
@@ -1450,9 +1450,6 @@ def run_dsl_puct(demos, test, op_bias=None, max_depth=2, num_simulations=100, c_
         c_puct: Exploration constant (higher = more exploration)
         return_rule_info: Whether to return rule metadata
         verbose: Verbose logging
-        causal_context: Optional dict with causal discovery information:
-            - 'explanation': Causal explanation dict with mechanisms and confidence
-            - 'hypotheses': List of causal hypotheses for operation filtering
 
     Returns:
         Predicted grid (and optionally rule_info dict)
@@ -1467,52 +1464,6 @@ def run_dsl_puct(demos, test, op_bias=None, max_depth=2, num_simulations=100, c_
                 out_colors = set(torch.unique(demo_out).tolist())
                 if in_colors != out_colors:
                     priors["color_map"] = 1.0
-
-    # === CAUSAL CONTEXT INTEGRATION ===
-    # Enhance op_bias with causal discovery insights
-    if causal_context is not None and op_bias is not None:
-        explanation = causal_context.get('explanation', {})
-        confidence = explanation.get('confidence', 0.0)
-
-        # Only apply causal adjustments if confidence is reasonable
-        if confidence > 0.3:
-            mechanisms = explanation.get('causal_mechanisms', [])
-
-            # Boost operations supported by causal evidence
-            causal_boost = {}
-            for mechanism in mechanisms[:3]:  # Top 3 mechanisms
-                relation_type = mechanism.get('relation_type', '')
-                strength = mechanism.get('strength', 0.0)
-                match_score = mechanism.get('match_score', 0.0)
-
-                boost_factor = strength * match_score * confidence
-
-                # Map causal relation types to operation boosts
-                if 'direct_cause' in relation_type or 'sufficient' in relation_type:
-                    # Strong causal evidence - significantly boost related ops
-                    for op_key in list(op_bias.keys())[:10]:  # Top biased ops
-                        if op_key not in causal_boost:
-                            causal_boost[op_key] = 0.0
-                        causal_boost[op_key] += boost_factor * 0.5
-
-            # Apply causal boosts to op_bias
-            for op, boost in causal_boost.items():
-                if op in op_bias:
-                    op_bias[op] = op_bias[op] * (1.0 + boost)
-
-            if verbose and causal_boost:
-                print(f"[PUCT-Causal] Applied causal boosts to {len(causal_boost)} operations, "
-                      f"confidence={confidence:.3f}")
-
-        # Prune operations with inhibitory causal evidence
-        for mechanism in explanation.get('causal_mechanisms', []):
-            relation_type = mechanism.get('relation_type', '')
-            if 'inhibitory' in relation_type:
-                # Downweight operations that causal model says are unlikely
-                # (This is a conservative pruning - we don't remove completely)
-                for op_key in list(op_bias.keys()):
-                    if op_key in op_bias:
-                        op_bias[op_key] = op_bias[op_key] * 0.7  # 30% reduction
 
     # Use beam search with PUCT-inspired selection (greedy best-first with op_bias as priors)
     # Note: Full PUCT requires policy/value networks; this is a lightweight approximation

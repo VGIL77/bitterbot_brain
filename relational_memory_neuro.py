@@ -96,10 +96,8 @@ class RelationalMemoryNeuro(nn.Module):
                                          "rewards": "rewarded_by", "guides": "guided_by",
                                          "has_goal": "goal_of", "enabled_by": "enables"}
 
-        # Memory buffer: Updated by EMA writes, NOT by optimizer
-        # This prevents conflicting gradient descent + EMA update paths
-        init_proto = F.normalize(torch.randn(self.N, self.D, device=self.device) * 0.01, p=2, dim=-1, eps=1e-8)
-        self.register_buffer("concept_proto", init_proto)
+        # Core learnable parameters - MUST receive gradients
+        self.concept_proto = nn.Parameter(torch.randn(self.N, self.D, device=self.device) * 0.01)
         self.A = nn.ParameterDict({
             r: nn.Parameter(torch.randn(self.N, self.R, device=self.device) * 0.01) 
             for r in self.relations
@@ -131,10 +129,9 @@ class RelationalMemoryNeuro(nn.Module):
         self.hebb_updates = 0
         self.depth_hist: List[int] = []
         
-        # Kuramoto oscillators: Buffers (dynamics driven by synchronization, not gradients)
-        # Prevents gradient descent + manual .data write conflicts (same issue as concept_proto)
-        self.register_buffer("theta", torch.randn(self.N, device=self.device) * 2 * math.pi)
-        self.register_buffer("omega", torch.randn(self.N, device=self.device) * 0.1)
+        # Kuramoto oscillators
+        self.theta = nn.Parameter(torch.randn(self.N, device=self.device) * 2 * math.pi)
+        self.omega = nn.Parameter(torch.randn(self.N, device=self.device) * 0.1)
         
         # Queue for post-optimizer updates
         self.hebbian_queue = []
@@ -427,9 +424,7 @@ class RelationalMemoryNeuro(nn.Module):
         B = self.B[rel]
         # Matrix multiplication with dimension safety
         A_safe, B_t_safe = self.dim_adapter.ensure_compatible(A, B.transpose(0, 1), "matmul")
-        # Clamp rel_gain to prevent overflow (preserves signal within numerical bounds)
-        gain_clamped = self.rel_gain[rel].clamp(-10.0, 10.0)
-        scores = (A_safe @ B_t_safe) * gain_clamped
+        scores = (A_safe @ B_t_safe) * self.rel_gain[rel]
         # Softplus ensures positive scores while maintaining gradients
         return F.softplus(scores)
 
@@ -483,14 +478,7 @@ class RelationalMemoryNeuro(nn.Module):
             if vec.dim() == 1:
                 vec = vec.unsqueeze(0)
 
-            # FAIL LOUD: Reject NaN/Inf inputs at boundary (no silent masking)
-            if not torch.isfinite(vec).all():
-                raise RuntimeError(
-                    f"[RelMem] bind_concept REJECTED: Input vec has NaN/Inf! "
-                    f"cid={cid}, vec_shape={vec.shape}, vec_norm={vec.norm().item():.4f}, "
-                    f"finite_fraction={torch.isfinite(vec).float().mean().item():.2%}"
-                )
-
+            # RelMem Loss Safety: Project if dimensional mismatch
             # Ensure vec is contiguous before reduction operations
             processed_vec = vec.contiguous().mean(0).detach()
             # Ensure vector is 1D for linear layer compatibility
@@ -563,11 +551,6 @@ class RelationalMemoryNeuro(nn.Module):
     def bind_concept_by_vector(self, vec: torch.Tensor, op_name: str, meta: Optional[dict] = None, alpha: float = 0.5):
         import logging
 
-        # CRITICAL: Detach vec from autograd graph before ANY .data writes
-        # Prevents gradient leaks from dopamine scores and other upstream sources
-        if vec is not None and vec.requires_grad:
-            vec = vec.detach().clone()
-
         # DEBUG: Always log when this method is called
         current_step = meta.get('step', 0) if meta else 0
         if current_step % 20 == 0:
@@ -635,10 +618,10 @@ class RelationalMemoryNeuro(nn.Module):
                     merge_alpha = min(0.3, success_score)  # Stronger success â†' stronger update
                     # Merge with normalization to prevent unbounded growth
                     merged_vec = (
-                        (1 - merge_alpha) * self.concept_proto[existing_cid] +
+                        (1 - merge_alpha) * self.concept_proto.data[existing_cid] +
                         merge_alpha * vec.to(self.device)
                     )
-                    self.concept_proto[existing_cid] = F.normalize(merged_vec, p=2, dim=-1, eps=1e-8)
+                    self.concept_proto.data[existing_cid] = F.normalize(merged_vec, p=2, dim=-1, eps=1e-8)
 
                     # Strengthen relationships for successful pattern
                     if op_name in self.relations:
@@ -740,9 +723,10 @@ class RelationalMemoryNeuro(nn.Module):
             sin_diff = torch.sin(theta_active.unsqueeze(0) - theta_active.unsqueeze(1))
             dtheta = self.omega[active] + (K / N_active) * sin_diff.sum(dim=1)
             theta_active = theta_active + dt * dtheta
-
-        # Update theta buffer (clean copy, no .data access)
-        self.theta[active].copy_(theta_active % (2 * math.pi))
+        
+        # Update theta without in-place operation
+        with torch.no_grad():
+            self.theta.data[active] = theta_active % (2 * math.pi)
 
     def inverse_loss(self) -> torch.Tensor:
         """Compute inverse relation consistency loss - fully differentiable"""
@@ -887,21 +871,11 @@ class RelationalMemoryNeuro(nn.Module):
     
     def apply_post_optimizer_hooks(self):
         """Apply queued concept bindings + Hebbian/WTA updates safely (corruption-proof)"""
-        # GPU-ONLY
-        self.device = torch.device("cuda")
-
-        # Gradient clipping for trainable Hebbian matrices (prevents overflow)
-        # A/B are nn.Parameters (trainable), unlike concept_proto/theta/omega (buffers)
-        hebbian_params = []
-        for rel in self.relations:
-            if rel in self.A:
-                hebbian_params.append(self.A[rel])
-            if rel in self.B:
-                hebbian_params.append(self.B[rel])
-        if hebbian_params:
-            torch.nn.utils.clip_grad_norm_(hebbian_params, max_norm=1.0)
-
-        # concept_proto is now a buffer (no gradients) - updated by EMA writes only
+        # Ensure device matches parameter device
+        try:
+            self.device = next(self.parameters()).device
+        except StopIteration:
+            self.device = torch.device("cuda")
 
         # --- CORRUPTION-PROOF SANITIZATION ---
         if not isinstance(getattr(self, "pending_concept_updates", {}), dict):
@@ -932,19 +906,9 @@ class RelationalMemoryNeuro(nn.Module):
                             logging.warning(f"[RelMem] Skipping out-of-bounds cid={cid} (N={self.N})")
                             continue
                         vec = vec.to(device=self.device, dtype=self.concept_proto.dtype)
-                        # EMA update with normalization (clean buffer write)
-                        updated_vec = (1 - float(alpha)) * self.concept_proto[cid] + float(alpha) * vec
-
-                        # FAIL LOUD: Reject NaN/Inf before writing to buffer
-                        if not torch.isfinite(updated_vec).all():
-                            old_norm = self.concept_proto[cid].norm().item()
-                            new_norm = vec.norm().item() if torch.isfinite(vec).all() else float('nan')
-                            raise RuntimeError(
-                                f"[RelMem] apply_updates REJECTED: updated_vec has NaN/Inf! "
-                                f"cid={cid}, alpha={alpha:.3f}, old_norm={old_norm:.4f}, new_norm={new_norm:.4f}"
-                            )
-
-                        self.concept_proto[cid].copy_(F.normalize(updated_vec, p=2, dim=-1, eps=1e-8))
+                        # EMA update with normalization to prevent unbounded growth
+                        updated_vec = (1 - float(alpha)) * self.concept_proto.data[cid] + float(alpha) * vec
+                        self.concept_proto.data[cid] = F.normalize(updated_vec, p=2, dim=-1, eps=1e-8)
                         applied += 1
                     except Exception as e:
                         import logging
@@ -960,20 +924,10 @@ class RelationalMemoryNeuro(nn.Module):
         try:
             active = self.concept_used.nonzero().flatten()
             if active.numel() > 0:
-                # FAIL LOUD: Check concept_proto for NaN BEFORE normalization spreads it
-                if not torch.isfinite(self.concept_proto[active]).all():
-                    nan_cids = active[~torch.isfinite(self.concept_proto[active]).all(dim=-1)]
-                    raise RuntimeError(
-                        f"[RelMem] apply_post_optimizer_hooks: concept_proto has NaN before normalization! "
-                        f"Corrupted cids={nan_cids.tolist()[:10]}, total_corrupted={nan_cids.numel()}/{active.numel()}"
-                    )
-                self.concept_proto[active].copy_(
-                    F.normalize(self.concept_proto[active], p=2, dim=-1, eps=1e-8)
+                self.concept_proto.data[active] = F.normalize(
+                    self.concept_proto.data[active], p=2, dim=-1, eps=1e-8
                 )
-        except RuntimeError as e:
-            # Re-raise FAIL LOUD errors (NaN detection)
-            if "NaN" in str(e) or "Inf" in str(e):
-                raise
+        except Exception as e:
             import logging
             logging.warning(f"[RelMem] Proto normalization failed: {e}")
 
@@ -1788,7 +1742,7 @@ class RelationalMemoryNeuro(nn.Module):
             if len(cluster) >= min_size:
                 cids = used[torch.tensor(cluster, device=self.device)]
                 centroid = self.concept_proto[cids].mean(dim=0, keepdim=True)
-                self.concept_proto[cids] = (1-merge_alpha)*self.concept_proto[cids] + merge_alpha*centroid
+                self.concept_proto.data[cids] = (1-merge_alpha)*self.concept_proto.data[cids] + merge_alpha*centroid
                 self.depth_hist.append(len(cluster))
                 visited.update(cluster)
 
@@ -2287,7 +2241,7 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
                 projected_vecs.append(vec)
 
             mean_vec = torch.stack(projected_vecs, dim=0).mean(0)
-            self.concept_proto[cid] = 0.8 * self.concept_proto[cid] + 0.2 * mean_vec
+            self.concept_proto.data[cid] = 0.8 * self.concept_proto.data[cid] + 0.2 * mean_vec
 
     @torch.no_grad()
     def consolidate_exemplars(self):
@@ -2507,8 +2461,8 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
             self._next_cid += 1
             self.concept_used[sid] = True
             if subj_vec is not None:
-                self.concept_proto[sid] = subj_vec.to(self.device).float()
-                self.add_or_update_exemplar(sid, self.concept_proto[sid], step=0)
+                self.concept_proto.data[sid] = subj_vec.to(self.device).float()
+                self.add_or_update_exemplar(sid, self.concept_proto.data[sid], step=0)
         else:
             sid = self._symbolic_index[subj_name]
             if subj_vec is not None:
@@ -2521,8 +2475,8 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
             self._next_cid += 1
             self.concept_used[oid] = True
             if obj_vec is not None:
-                self.concept_proto[oid] = obj_vec.to(self.device).float()
-                self.add_or_update_exemplar(oid, self.concept_proto[oid], step=0)
+                self.concept_proto.data[oid] = obj_vec.to(self.device).float()
+                self.add_or_update_exemplar(oid, self.concept_proto.data[oid], step=0)
         else:
             oid = self._symbolic_index[obj_name]
             if obj_vec is not None:
@@ -2676,8 +2630,8 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
             for cid, score in concept_scores[perturb_start:perturb_end]:
                 noise_scale = 0.2 * (1.0 - score)  # Weaker = more noise
                 noise = torch.randn_like(self.concept_proto[cid]) * noise_scale
-                self.concept_proto[cid] += noise
-                self.concept_proto[cid] = F.normalize(self.concept_proto[cid], dim=-1)
+                self.concept_proto.data[cid] += noise
+                self.concept_proto.data[cid] = F.normalize(self.concept_proto.data[cid], dim=-1)
                 logging.info(f"[RelMem Evolution] ðŸ”€ Perturbed concept {cid} (noise={noise_scale:.3f})")
 
         # === MUTATION STRATEGY 2: EM Rising (Clone + Reinforce) ===
@@ -3086,25 +3040,20 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
                 - op_bias: [B, num_ops] tensor
                 - confidence: [B] tensor
         """
-        # Device from input (GPU-first, but follows caller)
-        dev = query_vec.device
+        # Ensure on correct device
+        query_vec = query_vec.to(self.device)
         B = query_vec.shape[0]
         num_ops = len(dsl_ops)
-
-        # FAIL LOUD: concept_proto must be on GPU and finite
-        assert self.concept_proto.device.type == "cuda", f"[RelMem] concept_proto on {self.concept_proto.device}"
-        assert torch.isfinite(self.concept_proto).all(), \
-            f"[RelMem] concept_proto has NaN/Inf! This means gradients corrupted it during training."
 
         # Default concept dimension
         default_concept_dim = 256
 
-        # If no concepts learned yet, return zeros (device-aware)
+        # If no concepts learned yet, return zeros
         if not hasattr(self, 'concept_proto') or self.concept_proto is None or self.concept_proto.size(0) == 0:
             return {
-                'concept_emb': torch.zeros(B, default_concept_dim, device=dev),
-                'op_bias': torch.zeros(B, num_ops, device=dev),
-                'confidence': torch.zeros(B, device=dev)
+                'concept_emb': torch.zeros(B, default_concept_dim, device=self.device),
+                'op_bias': torch.zeros(B, num_ops, device=self.device),
+                'confidence': torch.zeros(B, device=self.device)
             }
 
         # Project query if needed
@@ -3113,69 +3062,42 @@ class RelationalMemoryExemplar(RelationalMemoryNeuro):
         else:
             query_proj = query_vec
 
-        # Compute cosine similarity to all concepts (safe normalization)
-        query_norm = F.normalize(query_proj, p=2, dim=-1, eps=1e-8)  # [B, D]
-        proto_norm = F.normalize(self.concept_proto, p=2, dim=-1, eps=1e-8)  # [N, D]
+        # Compute cosine similarity to all concepts
+        query_norm = F.normalize(query_proj, p=2, dim=-1)  # [B, D]
+        proto_norm = F.normalize(self.concept_proto, p=2, dim=-1)  # [N, D]
 
         sims = torch.matmul(query_norm, proto_norm.t())  # [B, N]
-        sims = sims.clamp(-1.0, 1.0)  # Prevent numerical overflow
-
-        # FAIL LOUD: Similarity matrix must be finite (upstream bug if not)
-        if not torch.isfinite(sims).all():
-            raise RuntimeError(
-                f"[RelMem] get_concept_embedding FAILED: Similarity matrix has NaN/Inf! "
-                f"query_norm={query_norm.shape}, proto_norm={proto_norm.shape}, "
-                f"finite_sims={torch.isfinite(sims).sum().item()}/{sims.numel()}"
-            )
 
         # Get top-k concepts
         top_sims, top_idx = torch.topk(sims, min(top_k, sims.size(-1)), dim=-1)  # [B, k]
 
-        # Softmax weights (clamped temperature to prevent overflow)
-        weights = F.softmax(top_sims.clamp(-10.0, 10.0) * 5.0, dim=-1)  # [B, k]
+        # Softmax weights
+        weights = F.softmax(top_sims * 5.0, dim=-1)  # [B, k], temperature=0.2
 
-        # Weighted average of concept embeddings (device-aware)
-        top_concepts = self.concept_proto[top_idx].to(dev)  # [B, k, D]
-
-        # FAIL LOUD: Check inputs to einsum
-        assert torch.isfinite(weights).all(), f"[RelMem] weights has NaN before einsum!"
-        assert torch.isfinite(top_concepts).all(), f"[RelMem] top_concepts has NaN before einsum!"
-
+        # Weighted average of concept embeddings
+        top_concepts = self.concept_proto[top_idx]  # [B, k, D]
         concept_emb = torch.einsum('bk,bkd->bd', weights, top_concepts)  # [B, D]
 
-        # FAIL LOUD: Check output
-        assert torch.isfinite(concept_emb).all(), f"[RelMem] NaN after einsum! (inputs were finite)"
-
-        # Project to standard dimension if needed (device-aware)
+        # Project to standard dimension if needed
         if concept_emb.shape[-1] != default_concept_dim:
             if not hasattr(self, '_concept_proj'):
-                proj = nn.Linear(self.D, default_concept_dim, device=dev)
-                nn.init.xavier_uniform_(proj.weight)
-                nn.init.zeros_(proj.bias)
-                # Register as submodule so .to(device) propagates properly
-                self.add_module('_concept_proj', proj)
+                self._concept_proj = nn.Linear(self.D, default_concept_dim, device=self.device)
             concept_emb = self._concept_proj(concept_emb)
 
-        # Build op_bias tensor (device-aware)
-        op_bias_tensor = torch.zeros(B, num_ops, device=dev)
+        # Build op_bias tensor from stored metadata
+        op_bias_tensor = torch.zeros(B, num_ops, device=self.device)
 
         # Get op_bias dict using existing method
         op_bias_dict = self.get_op_bias(dsl_ops=dsl_ops, scale=scale, query_vec=query_vec)
 
-        # Convert dict to tensor (device-aware: Python floats → device tensors)
+        # Convert dict to tensor
         for i, op_name in enumerate(dsl_ops):
             if op_name in op_bias_dict:
-                # Ensure GPU scalar, no CPU float broadcasts
-                op_bias_tensor[:, i] = torch.tensor(
-                    float(op_bias_dict[op_name]),
-                    device=dev,
-                    dtype=op_bias_tensor.dtype
-                )
+                op_bias_tensor[:, i] = op_bias_dict[op_name]
 
         # Confidence from top similarity
         confidence = top_sims[:, 0].clamp(0, 1)  # [B]
 
-        # Device-aware: All outputs on same device as input
         return {
             'concept_emb': concept_emb,
             'op_bias': op_bias_tensor,

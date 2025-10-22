@@ -61,35 +61,6 @@ cortex:
   # Aux loss cap (relaxed for aggressive training)
   max_aux_ratio: 0.15  # AGGRESSIVE: Allow 15% (was 10%)
 
-  # Cortex integration with search and refinement
-  use_in_ebr: true  # Wire Cortex prior scales to EBR energy terms
-  use_in_puct: false  # Wire Cortex op_bias to PUCT (disabled for conservative start)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SynergyFusion: Cortex + RelMem + BrainGraph Unified Priors
-# ═══════════════════════════════════════════════════════════════════════════
-# Fuses three sources of knowledge into gradient-carrying priors:
-#   - Cortex: Predictive coding residuals (φ, κ, CGE scales)
-#   - RelMem: Episodic concept embeddings + operation biases
-#   - BrainGraph: Structural task embeddings (reversible knowledge graph)
-#
-# Outputs:
-#   - op_prior_logits: DSL operation priors for search
-#   - resid_nudge: Brain latent enrichment vector
-#
-# Architecture: Trust-gated blending with reparameterization trick for
-# confidence-weighted gradients (precision-weighted prediction errors).
-#
-# Expected impact: +5-10pp EM from neurosymbolic prior fusion
-# Param cost: +2-3M params (SynergyFusion module)
-
-# SynergyFusion flat config (AGGRESSIVE settings)
-synergy_fusion_enabled: true  # ⚡ MASTER KILL SWITCH ⚡
-synergy_fusion_trust_temp: 1.2  # AGGRESSIVE: Higher exploration
-synergy_fusion_lambda_kl: 1.5  # AGGRESSIVE: Stronger KL convergence
-synergy_fusion_resid_weight: 0.3  # AGGRESSIVE: Stronger brain nudging
-synergy_fusion_op_prior_weight: 0.6  # AGGRESSIVE: Stronger prior fusion
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Dopamine Replay (From Phase 3, Proven)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -152,43 +123,10 @@ dream:
   wall_time_s: 3.0  # AGGRESSIVE: More dream time (was 2.0)
 
   # Dream pretrain (warm-up hierarchical + dream)
-  pretrain_epochs: 2  # 2 epochs (default, overridden by phased_training.dream_pretrain_epochs if enabled)
+  pretrain_epochs: 3  # AGGRESSIVE: 3 epochs (was 1) for thorough warmup
   pretrain_batches: 300  # AGGRESSIVE: More batches (was 200)
   pretrain_freeze_model: true
   full_every: 3  # AGGRESSIVE: More frequent consolidation (was 4)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Phased Training (WGO Oracle Learning Pipeline)
-# ═══════════════════════════════════════════════════════════════════════════
-# Three-phase training for learned WGO (World Graph Oracle):
-#   Phase 0: Dream pretrain (optional, 2 epochs)
-#   Phase 1: Encoder warmup (simple forward, 2 epochs)
-#   Phase 2: WGO supervised learning on synthetic tasks (3 epochs)
-#   Phase 3: Joint training with learned WGO oracle (main training)
-#
-# Usage:
-#   python train_parent.py --config configs/atlas_andromeda.yaml --training-phases 1,2,3
-
-phased_training:
-  # Enable phased training (set via --training-phases CLI arg)
-  enabled: false  # Set to true via --training-phases 1,2,3
-  training_phases: [1, 2, 3]  # Which phases to run (can override via CLI)
-
-  # Phase 0: Dream pretrain (optional warm-start)
-  dream_pretrain_epochs: 2  # Dream-only warmup before Phase 1
-  dream_pretrain_batches: 300  # AGGRESSIVE: More batches for dream warmup
-
-  # Phase 1: Encoder warmup (simple forward, CE loss only)
-  phase1_epochs: 2  # Encoder foundation training
-
-  # Phase 2: WGO supervised learning (AGGRESSIVE settings)
-  phase2_epochs: 2  # WGO head training on synthetic tasks
-  phase2_synthetic_count: 15000  # AGGRESSIVE: More synthetic tasks (was 12000)
-  phase2_batch_size: 8  # Batch size for Phase 2
-  phase2_val_split: 0.2  # Validation split for WGO training
-
-  # Phase 3: Joint training (uses main training config)
-  # phase3_epochs is set by training.epochs (main training loop)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Orbit-CEGIS

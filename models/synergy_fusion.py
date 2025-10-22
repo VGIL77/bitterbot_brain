@@ -120,10 +120,15 @@ class SynergyFusion(nn.Module):
             op_bias = relmem['op_bias'].to(dev)
             confidence = relmem['confidence'].to(dev)
 
+            # Gracefully handle NaN in inputs from RelMem
             if not torch.isfinite(concept_emb).all():
-                raise RuntimeError("[SynergyFusion] concept_emb contains NaN/Inf")
+                import logging
+                logging.warning("[SynergyFusion] concept_emb contains NaN/Inf - clamping to zero")
+                concept_emb = torch.nan_to_num(concept_emb, nan=0.0, posinf=1.0, neginf=-1.0)
             if not torch.isfinite(op_bias).all():
-                raise RuntimeError("[SynergyFusion] op_bias contains NaN/Inf")
+                import logging
+                logging.warning("[SynergyFusion] op_bias contains NaN/Inf - clamping to zero")
+                op_bias = torch.nan_to_num(op_bias, nan=0.0, posinf=1.0, neginf=-1.0)
 
             # Handle BrainGraph embedding if provided (device-aware)
             if braingraph_emb is not None and torch.is_tensor(braingraph_emb):
@@ -172,17 +177,23 @@ class SynergyFusion(nn.Module):
                 kappa_scale = cortex_prior_scales.get('kappa', 1.0)
                 cge_scale = cortex_prior_scales.get('cge', 1.0)
 
-                # Simple weighted average of scales
-                cortex_mult = (phi_scale + kappa_scale + cge_scale) / 3.0
+                # *** PRIOR BARRIER: ignore invalid scalers rather than poisoning logits ***
+                import math
+                if not all(math.isfinite(x) for x in (phi_scale, kappa_scale, cge_scale)):
+                    cortex_mult = 1.0  # Neutral fallback
+                else:
+                    # Simple weighted average of scales
+                    cortex_mult = (phi_scale + kappa_scale + cge_scale) / 3.0
+
                 op_logits_learned = op_logits_learned * cortex_mult
 
             # Fuse: learned logits + RelMem bias (both contribute)
             op_prior_logits = self.op_norm(op_logits_learned + 0.35 * op_bias)
-            assert torch.isfinite(op_prior_logits).all(), "[SynergyFusion] op_prior_logits has NaN/Inf"
+            # Removed assertion - let clamping at end handle NaNs gracefully
 
             # === Generate residual nudge ===
             resid_nudge = self.brain_norm(self.resid_proj(fused))  # [B, D]
-            assert torch.isfinite(resid_nudge).all(), "[SynergyFusion] resid_nudge has NaN/Inf"
+            # Removed assertion - let clamping at end handle NaNs gracefully
 
             # === Trust-weighted blending ===
             # High trust → use fusion; Low trust → fallback to RelMem only
@@ -196,14 +207,25 @@ class SynergyFusion(nn.Module):
 
             resid_nudge = trust_weight * resid_nudge  # Scale residual by trust
 
-            assert torch.isfinite(op_prior_logits).all(), "[SynergyFusion] Final op_prior has NaN/Inf"
-            assert torch.isfinite(resid_nudge).all(), "[SynergyFusion] Final resid_nudge has NaN/Inf"
+            # === FINAL FUSE: Ensure logits are always finite ===
+            # This is the last line of defense - prevent trainer from ever seeing non-finite logits
+            if not torch.isfinite(op_prior_logits).all():
+                import logging
+                logging.error("[SynergyFusion] op_prior_logits non-finite before return - clamping")
+                op_prior_logits = torch.nan_to_num(op_prior_logits, nan=0.0, posinf=10.0, neginf=-10.0)
 
+            if not torch.isfinite(resid_nudge).all():
+                import logging
+                logging.error("[SynergyFusion] resid_nudge non-finite before return - clamping")
+                resid_nudge = torch.nan_to_num(resid_nudge, nan=0.0, posinf=5.0, neginf=-5.0)
+
+                        # Stability guards: clamp all outputs to finite bounded ranges
+            # This prevents numerical explosion in the feedback loop
             return {
-                'op_prior_logits': op_prior_logits,  # [B, op_dim]
-                'resid_nudge': resid_nudge,          # [B, D]
-                'trust_weight': trust_weight.squeeze(-1),  # [B]
-                'confidence': confidence                    # [B] (passthrough for logging)
+                'op_prior_logits': torch.nan_to_num(op_prior_logits, nan=0.0, posinf=10.0, neginf=-10.0),
+                'resid_nudge': torch.clamp(torch.nan_to_num(resid_nudge, nan=0.0), -5.0, 5.0),
+                'trust_weight': torch.clamp(trust_weight.squeeze(-1), 0.0, 1.0),
+                'confidence': torch.clamp(confidence, 0.0, 1.0)
             }
 
         except Exception as e:

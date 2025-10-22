@@ -8,11 +8,6 @@ Simplified Direct HRM-TOPAS Training (robust version)
 """
 
 import torch
-
-# GPU-FIRST global default (prevents stray CPU tensor allocations)
-if torch.cuda.is_available():
-    torch.set_default_device("cuda")
-
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -998,9 +993,6 @@ def dopamine_reward(task, buffer, logger, global_step, score: float = 1.0, compo
     - Bypass ALL unhashable dict/Tensor issues
     - Log buffer growth and reward details
     """
-    # CRITICAL: Detach score from autograd graph to prevent gradient leaks into RelMem
-    score = float(score.detach().item() if torch.is_tensor(score) else score)
-
     if buffer is None:
         return
     try:
@@ -1229,18 +1221,6 @@ def parse_args():
                         help="Weight for cortex entropy flux loss")
     parser.add_argument("--lambda-cortex-sparsity", type=float, default=0.25,
                         help="Weight for cortex KL sparsity loss")
-
-    # SynergyFusion (ON by default, disable with --no-synergy-fusion)
-    parser.add_argument("--no-synergy-fusion", action="store_false", dest="synergy_fusion_enabled",
-                        help="Disable SynergyFusion (Cortex+RelMem+BrainGraph fusion, enabled by default)")
-    parser.add_argument("--synergy-trust-temp", type=float, default=1.0, dest="synergy_fusion_trust_temp",
-                        help="SynergyFusion trust temperature (default: 1.0)")
-    parser.add_argument("--synergy-lambda-kl", type=float, default=1.0, dest="synergy_fusion_lambda_kl",
-                        help="SynergyFusion KL loss weight (default: 1.0)")
-    parser.add_argument("--synergy-resid-weight", type=float, default=0.2, dest="synergy_fusion_resid_weight",
-                        help="SynergyFusion brain residual weight (default: 0.2)")
-    parser.add_argument("--synergy-op-prior-weight", type=float, default=0.5, dest="synergy_fusion_op_prior_weight",
-                        help="SynergyFusion operation prior blend weight (default: 0.5)")
 
     # Stage-6: Refinement Loop Configuration
     parser.add_argument("--no-refine-loop", action="store_true", default=False,
@@ -2363,11 +2343,6 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             if hrm_latents is not None and hrm_latents.dtype == torch.bfloat16:
                 hrm_latents = hrm_latents.float()
 
-            # === HARD FAIL SAFETY NET (GPU-FIRST enforcement) ===
-            if hrm_latents is not None:
-                assert torch.isfinite(hrm_latents).all(), "[Train] HRM latents contain NaN/Inf"
-                assert hrm_latents.device.type == "cuda", f"[Train] HRM latents on wrong device: {hrm_latents.device}"
-
         except Exception:
             hrm_latents = None
 
@@ -2441,7 +2416,7 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 # Batch debug probe for CE spikes
                 if global_step % 100 == 0 and ce_loss > 2.0:  # Log when CE loss is high
                     batch_shapes = [tuple(input_grid.shape), tuple(target_grid.shape)]
-                    logger.info(f"[BATCH DEBUG] CE_spike={ce_loss.item():.3f} batch_shapes={batch_shapes}")
+                    logging.info(f"[BATCH DEBUG] CE_spike={ce_loss.item():.3f} batch_shapes={batch_shapes}")
                 
                 # Dream health check - log cached tokens if available
                 if global_step % 100 == 0 and getattr(topas_model, "_dream_tokens", None) is not None:
@@ -2857,13 +2832,6 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             return None
 
         scaler.scale(loss).backward()
-
-        # CRITICAL: Sanitize concept_proto gradients immediately after backward
-        if hasattr(topas_model, 'relmem') and hasattr(topas_model.relmem, 'concept_proto'):
-            if topas_model.relmem.concept_proto.grad is not None:
-                if not torch.isfinite(topas_model.relmem.concept_proto.grad).all():
-                    logger.error(f"[GRAD SANITIZE] concept_proto.grad has NaN/Inf! Zeroing to prevent corruption.")
-                    topas_model.relmem.concept_proto.grad.zero_()
 
         # Gradient probe: verify dopamine replay produces real gradients
         if "dopamine_replay" in outputs.get("losses", {}):
@@ -4594,19 +4562,13 @@ def main():
                 if capacity_pct > 80:
                     logger.warning(f"[RelMem] ⚠️ Capacity at {capacity_pct:.1f}% - approaching limit!")
 
-                    # GPU-first pruning: trigger early to keep hot concepts on GPU
-                    logger.info(f"[RelMem] 🔧 GPU-first pruning triggered at {capacity_pct:.1f}% capacity")
+                # Auto-prune if >90% full and epoch >= 40 (after template library matures)
+                if capacity_pct > 90 and epoch >= 40:
+                    logger.warning(f"[RelMem] 🔧 Auto-pruning triggered at {capacity_pct:.1f}% capacity")
                     try:
-                        if hasattr(topas_model.relmem, 'prune_if_needed'):
-                            # Prune to 70% capacity, keep 60% hottest on GPU
-                            topas_model.relmem.prune_if_needed(threshold=0.8)
-                            # Recount after pruning
-                            active_after = int(topas_model.relmem.concept_used.sum().item())
-                            pruned_count = active_concepts - active_after
-                            logger.info(f"[RelMem] Pruned {pruned_count} concepts: {active_concepts} → {active_after}")
-                        elif hasattr(topas_model.relmem, 'prune_compact'):
-                            # Fallback to old method
+                        if hasattr(topas_model.relmem, 'prune_compact'):
                             topas_model.relmem.prune_compact(max_concepts=int(max_concepts * 0.8), merge_cos=0.985)
+                            # Recount after pruning
                             active_after = int(topas_model.relmem.concept_used.sum().item())
                             pruned_count = active_concepts - active_after
                             logger.info(f"[RelMem] Pruned {pruned_count} concepts: {active_concepts} → {active_after}")

@@ -51,7 +51,6 @@ from models.rel_graph import RelGraph, ObjectRelationPredictor
 from models.painter import NeuralPainter
 from models.hrm_topas_bridge import HRMTOPASBridge, HRMTOPASIntegrationConfig
 from models.dsl_search import run_dsl_puct as beam_search, DSLProgram, apply_program
-from models.synergy_fusion import SynergyFusion
 
 
 def _extract_grid_attributes(grid: torch.Tensor, demos: list = None) -> List[str]:
@@ -764,16 +763,6 @@ class ModelConfig:
     lambda_cortex_entropy: float = 1.0      # Entropy flux regularization
     lambda_cortex_sparsity: float = 0.5     # KL sparsity on latent codes
 
-    # ---- Causal Discovery Integration ----
-    enable_causal_discovery: bool = True           # Enable causal mechanism learning
-    causal_feature_dim: int = 512                  # Feature dimension for causal engine (matches slot_dim)
-    causal_max_graph_size: int = 1000             # Max causal graph edges
-    causal_intervention_strength: float = 0.3      # Intervention strength for causal testing
-    causal_op_bias_w: float = 0.35                # Weight for causal-derived op biases
-    lambda_causal_consistency: float = 0.05        # Causal consistency loss weight
-    lambda_causal_intervention: float = 0.03       # Intervention prediction loss weight
-    lambda_causal_counterfactual: float = 0.02     # Counterfactual reasoning loss weight
-
     def validate(self):
         """Validate configuration parameters"""
         assert self.width > 0, "width must be positive"
@@ -921,27 +910,7 @@ class TopasARC60M(nn.Module):
             )
         else:
             self.relmem = None
-
-        # --- Causal Discovery Engine (feature-flagged) ---
-        self.enable_causal = bool(getattr(self.config, "enable_causal_discovery", True))
-        if self.enable_causal:
-            try:
-                from trainers.causal_discovery import CausalDiscoveryEngine
-                self.causal_engine = CausalDiscoveryEngine(
-                    feature_dim=getattr(self.config, "causal_feature_dim", self.config.slot_dim),
-                    max_causal_graph_size=getattr(self.config, "causal_max_graph_size", 1000),
-                    intervention_strength=getattr(self.config, "causal_intervention_strength", 0.3),
-                    device=str(self._get_device())
-                )
-                print(f"[CausalDiscovery] Initialized with feature_dim={self.causal_engine.feature_dim}, "
-                      f"max_graph_size={self.causal_engine.max_causal_graph_size}")
-            except Exception as e:
-                print(f"[CausalDiscovery] Initialization failed: {e}, disabling causal discovery")
-                self.causal_engine = None
-                self.enable_causal = False
-        else:
-            self.causal_engine = None
-
+        
         # Legacy DSLHead fallback removed. All DSL calls route through dsl_search.
         self.simple_dsl = None
         
@@ -1182,30 +1151,6 @@ class TopasARC60M(nn.Module):
                 self.cortex = None
         elif self.config.verbose and not _HAS_CORTEX:
             print("[TOPAS] Andromeda Cortex disabled (module not available)")
-
-        # SynergyFusion: Fuse Cortex + RelMem + BrainGraph priors (ON by default)
-        self.synergy = None
-        synergy_enabled = getattr(self.config, 'synergy_fusion_enabled', True)  # DEFAULT: ON
-        if synergy_enabled:
-            try:
-                self.synergy = SynergyFusion(
-                    brain_dim=self.ctrl_dim,
-                    op_dim=n_ops,
-                    concept_dim=256,
-                    trust_temp=getattr(self.config, 'synergy_fusion_trust_temp', 1.0),
-                    device=self._get_device()
-                )
-                # Ensure sync after init
-                self.synergy.to(self._get_device())
-                if self.config.verbose:
-                    param_count = sum(p.numel() for p in self.synergy.parameters())
-                    print(f"[TOPAS] SynergyFusion initialized: {param_count:,} params "
-                          f"(brain_dim={self.ctrl_dim}, op_dim={n_ops}, concept_dim=256)")
-            except Exception as e:
-                logging.warning(f"[TOPAS] SynergyFusion init failed: {e}")
-                self.synergy = None
-        elif self.config.verbose:
-            print("[TOPAS] SynergyFusion disabled (synergy_fusion_enabled=false)")
 
         # Replace encoder with HRM-aware version if HRM is available
         if self._has_planner:
@@ -1842,81 +1787,7 @@ class TopasARC60M(nn.Module):
             self._cache_dream_tokens(brain_tokens, 1, 1)  # H=1, W=1 since brain is a single vector
         except Exception as e:
             print(f"[WARN] Failed to cache dream tokens: {e}")
-
-        # === CAUSAL DISCOVERY: Learn mechanisms from demo transformations ===
-        causal_hypotheses = []
-        if self.enable_causal and self.causal_engine is not None and training_mode and demos:
-            try:
-                # Extract features from demo pairs
-                transformation_examples = []
-
-                for demo in demos[:4]:  # Limit to 4 demos for efficiency
-                    if isinstance(demo, dict):
-                        demo_in = demo.get('input')
-                        demo_out = demo.get('output')
-                    elif isinstance(demo, (tuple, list)) and len(demo) >= 2:
-                        demo_in, demo_out = demo[0], demo[1]
-                    else:
-                        continue
-
-                    if demo_in is None or demo_out is None:
-                        continue
-
-                    # Ensure tensors and add batch dimension if needed
-                    if demo_in.dim() == 2:
-                        demo_in = demo_in.unsqueeze(0)
-                    if demo_out.dim() == 2:
-                        demo_out = demo_out.unsqueeze(0)
-
-                    # Encode input and output to get features (keep gradients in training mode)
-                    try:
-                        demo_in_enc = demo_in.unsqueeze(1).float() / (self.num_colors - 1)
-                        demo_out_enc = demo_out.unsqueeze(1).float() / (self.num_colors - 1)
-
-                        # Extract features from encoder (before state)
-                        feat_in, glob_in = self.encoder(demo_in_enc, hrm_context)
-
-                        # Extract features from encoder (after state)
-                        feat_out, glob_out = self.encoder(demo_out_enc, hrm_context)
-
-                        # Get slot representations for richer feature extraction
-                        slots_in_output = self.slots(feat_in)
-                        slots_out_output = self.slots(feat_out)
-
-                        slots_in = slots_in_output[0] if isinstance(slots_in_output, (tuple, list)) else slots_in_output
-                        slots_out = slots_out_output[0] if isinstance(slots_out_output, (tuple, list)) else slots_out_output
-
-                        # Package transformation example for causal learning
-                        transformation_examples.append({
-                            'before': slots_in,  # [B, K, D] slot features
-                            'after': slots_out,   # [B, K, D] slot features
-                            'context': {
-                                'demo_input_shape': tuple(demo_in.shape),
-                                'demo_output_shape': tuple(demo_out.shape),
-                                'operations': self._infer_relations_from_demo(demo_in[0], demo_out[0])
-                            }
-                        })
-                    except Exception as e:
-                        if self.config.verbose:
-                            print(f"[CausalDiscovery] Failed to encode demo: {e}")
-                        continue
-
-                # Learn causal mechanisms from collected transformations
-                if transformation_examples:
-                    learning_stats = self.causal_engine.learn_causal_mechanisms(transformation_examples)
-
-                    if self.config.verbose and learning_stats.get('new_causal_links', 0) > 0:
-                        print(f"[CausalDiscovery] Learned {learning_stats['new_causal_links']} causal links, "
-                              f"{learning_stats['hypotheses_confirmed']} hypotheses confirmed")
-
-                    # Store causal insights in extras
-                    extras['causal_learning_stats'] = learning_stats
-                    extras['causal_quality'] = self.causal_engine.assess_causal_understanding_quality()
-
-            except Exception as e:
-                import logging
-                logging.warning(f"[CausalDiscovery] Mechanism learning failed: {e}")
-
+        
         # Compute tokens for priors: use feature map if available; fallback to slots_rel
         # Note: These are for prior computation, not dream tokens
         try:
@@ -2255,71 +2126,7 @@ class TopasARC60M(nn.Module):
             # Combine planner op_bias with existing bias (additive)
             for k, v in planner_op_bias.items():
                 op_bias[k] = op_bias.get(k, 0.0) + v * 0.5  # Scale planner bias to 50%
-
-            # === CAUSAL DISCOVERY: Generate explanation and enhance op_bias ===
-            if self.enable_causal and self.causal_engine is not None:
-                try:
-                    # Generate causal explanation for test transformation
-                    # Use test features (slots_rel) as current state
-                    causal_explanation = self.causal_engine.generate_causal_explanation(
-                        transformation={'before': slots_rel, 'after': slots_rel},  # Use current state
-                        top_k=5
-                    )
-
-                    # Store explanation in extras for transparency
-                    extras['causal_explanation'] = {
-                        'confidence': causal_explanation.get('confidence', 0.0),
-                        'explanation_text': causal_explanation.get('explanation_text', ''),
-                        'num_mechanisms': len(causal_explanation.get('causal_mechanisms', []))
-                    }
-
-                    # Extract operation biases from causal mechanisms
-                    causal_op_bias = {}
-                    for mechanism in causal_explanation.get('causal_mechanisms', []):
-                        relation_type = mechanism.get('relation_type', '')
-                        strength = mechanism.get('strength', 0.0)
-                        confidence = mechanism.get('confidence', 0.0)
-                        match_score = mechanism.get('match_score', 0.0)
-
-                        # Map causal relation types to DSL operations
-                        # This is a heuristic mapping based on common transformation types
-                        causal_weight = strength * confidence * match_score
-
-                        if 'rotation' in relation_type or 'transform' in relation_type:
-                            causal_op_bias['rotate90'] = causal_op_bias.get('rotate90', 0.0) + causal_weight * 0.3
-                            causal_op_bias['rotate180'] = causal_op_bias.get('rotate180', 0.0) + causal_weight * 0.3
-                            causal_op_bias['rotate270'] = causal_op_bias.get('rotate270', 0.0) + causal_weight * 0.3
-
-                        if 'flip' in relation_type or 'reflection' in relation_type:
-                            causal_op_bias['flip_h'] = causal_op_bias.get('flip_h', 0.0) + causal_weight * 0.4
-                            causal_op_bias['flip_v'] = causal_op_bias.get('flip_v', 0.0) + causal_weight * 0.4
-
-                        if 'color' in relation_type or 'recolor' in relation_type:
-                            causal_op_bias['color_map'] = causal_op_bias.get('color_map', 0.0) + causal_weight * 0.5
-
-                        if 'translate' in relation_type or 'shift' in relation_type:
-                            causal_op_bias['translate'] = causal_op_bias.get('translate', 0.0) + causal_weight * 0.4
-
-                        if 'scale' in relation_type or 'resize' in relation_type:
-                            causal_op_bias['scale'] = causal_op_bias.get('scale', 0.0) + causal_weight * 0.3
-                            causal_op_bias['resize_nn'] = causal_op_bias.get('resize_nn', 0.0) + causal_weight * 0.3
-
-                    # Merge causal biases into op_bias
-                    causal_weight_factor = getattr(self.config, 'causal_op_bias_w', 0.35)
-                    for k, v in causal_op_bias.items():
-                        if k in DSL_OPS:
-                            op_bias[k] = op_bias.get(k, 0.0) + float(v) * causal_weight_factor
-
-                    if self.config.verbose and causal_op_bias:
-                        top_causal = sorted([(k,v) for k,v in causal_op_bias.items() if v > 0.05],
-                                          key=lambda x: -x[1])[:3]
-                        print(f"[CausalDiscovery] Op bias from causal mechanisms: {top_causal}")
-                        print(f"[CausalDiscovery] Explanation confidence: {causal_explanation.get('confidence', 0.0):.3f}")
-
-                except Exception as e:
-                    import logging
-                    logging.warning(f"[CausalDiscovery] Explanation generation failed: {e}")
-
+            
             # Filter op_bias to only include valid registry ops
             op_bias = {k: v for k, v in op_bias.items() if k in DSL_OPS}
             print(f"[RAIL-DSL] Starting DSL search: depth={depth}, beam={beam_w}")
@@ -2525,18 +2332,10 @@ class TopasARC60M(nn.Module):
 
                     # === PUCT BEAM SEARCH (Signal Purity: NO_GRAD for exploration) ===
                     with torch.no_grad():
-                        # Prepare causal context for DSL search
-                        causal_context_for_dsl = None
-                        if self.enable_causal and 'causal_explanation' in extras:
-                            causal_context_for_dsl = {
-                                'explanation': extras.get('causal_explanation', {}),
-                                'quality': extras.get('causal_quality', 0.0)
-                            }
-
-                        # Enhanced beam_search call with operation bias and causal context
+                        # Enhanced beam_search call with operation bias (including market priors)
                         dsl_result = beam_search(demos, test_grid[0] if test_grid.dim() == 4 else test_grid,
                                                 priors, max_depth=depth, beam=beam_w, verbose=self.config.verbose,
-                                                return_rule_info=True, op_bias=op_bias, causal_context=causal_context_for_dsl)
+                                                return_rule_info=True, op_bias=op_bias)
                     
                     if isinstance(dsl_result, tuple):
                         dsl_pred, rule_info = dsl_result
@@ -4186,7 +3985,9 @@ class TopasARC60M(nn.Module):
 
             # Kill if too many calls for same step (higher threshold for PUCT/eval)
             # During PUCT search, forward_pretraining is called many times (once per node)
-            max_calls = 1000 if not self.training else 20
+            # Eval mode: 50K threshold for multi-task PUCT evaluation (20 tasks × 8 searches × ~100 sims = ~16K calls)
+            # Training mode: 20 calls (strict loop detection for training purity)
+            max_calls = 50000 if not self.training else 20
             if self._forward_call_count[global_step] > max_calls:
                 import logging
                 logging.error(f"[LOOP DETECTED] forward_pretraining called {self._forward_call_count[global_step]} times for step={global_step}!")
@@ -4359,70 +4160,6 @@ class TopasARC60M(nn.Module):
                 except Exception as e:
                     import logging
                     logging.warning(f"[Cortex] Forward fusion failed: {e}")
-
-            # === SYNERGY FUSION: Cortex + RelMem + BrainGraph ===
-            # Fuse neurosymbolic priors for operation head and brain enrichment
-            op_prior_synergy = None
-            if self.synergy is not None and brain is not None:
-                try:
-                    import logging
-                    # Get DSL ops for RelMem retrieval
-                    DSL_OPS = get_dsl_ops()
-
-                    # Get RelMem concept embeddings (GPU-first retrieval)
-                    relmem_dict = self.relmem.get_concept_embedding(
-                        query_vec=brain,  # [B, ctrl_dim]
-                        dsl_ops=DSL_OPS,
-                        scale=getattr(self.config, 'relmem_op_bias_scale', 1.0)
-                    )
-
-                    # Get BrainGraph puzzle embedding if available
-                    braingraph_emb = None
-                    if hasattr(self, 'brain_graph') and self.brain_graph is not None:
-                        try:
-                            # Extract attributes from test grid
-                            attrs = _extract_grid_attributes(test_grid, demos)
-                            # Convert attrs list to dict with unit weights
-                            attrs_dict = {attr: 1.0 for attr in attrs}
-                            braingraph_emb = self.brain_graph.to_puzzle_embedding(attrs_dict)
-                            # GPU-FIRST: Force to GPU (cardinal rule from CLAUDE.md)
-                            if braingraph_emb is not None:
-                                braingraph_emb = braingraph_emb.to(brain.device)
-                        except Exception as e:
-                            logging.debug(f"[SynergyFusion] BrainGraph embedding failed: {e}")
-
-                    # Get Cortex prior scales if available
-                    cortex_prior_scales = extras.get("cortex", {}).get("prior_scales") if self.cortex is not None else None
-
-                    # Fuse all priors
-                    synergy_out = self.synergy(
-                        brain=brain,
-                        cortex_prior_scales=cortex_prior_scales,
-                        relmem=relmem_dict,
-                        braingraph_emb=braingraph_emb
-                    )
-
-                    # Apply brain enrichment (residual nudge)
-                    resid_weight = getattr(self.config, 'synergy_fusion_resid_weight', 0.2)
-                    brain = brain + resid_weight * synergy_out['resid_nudge']
-
-                    # Store fused op priors for operation head
-                    op_prior_synergy = synergy_out['op_prior_logits']
-
-                    # Export metrics to extras for logging
-                    extras.setdefault("synergy", {})
-                    extras["synergy"]["trust_weight"] = float(synergy_out['trust_weight'].mean().item())
-                    extras["synergy"]["confidence"] = float(synergy_out['confidence'].mean().item())
-
-                    if self.config.verbose and global_step % 100 == 0:
-                        logging.info(f"[SynergyFusion] Step {global_step}: "
-                                   f"trust={extras['synergy']['trust_weight']:.3f}, "
-                                   f"conf={extras['synergy']['confidence']:.3f}")
-
-                except Exception as e:
-                    import logging
-                    logging.warning(f"[SynergyFusion] Forward fusion failed: {e}")
-                    op_prior_synergy = None
 
             # === HIERARCHICAL ABSTRACTION ENHANCEMENT ===
             # Extract multi-level patterns from brain features for enhanced generalization
@@ -4833,13 +4570,7 @@ class TopasARC60M(nn.Module):
                 # Predict operation distribution from brain
                 op_logits = self.operation_head(brain)  # [B, 41]
                 logging.debug(f"[AuxOp] op_logits.shape={op_logits.shape}")
-
-                # Blend with SynergyFusion priors if available
-                if op_prior_synergy is not None:
-                    op_prior_weight = getattr(self.config, 'synergy_fusion_op_prior_weight', 0.5)
-                    op_logits = op_logits + op_prior_weight * op_prior_synergy
-                    logging.debug(f"[SynergyFusion] Blended op priors (weight={op_prior_weight})")
-
+    
                 # Get episodic memory biases from DreamEngine (skip during replay)
                 episodic_bias = {}
                 if not replay_mode and self.config.enable_dream and self.dream is not None:
@@ -4892,34 +4623,6 @@ class TopasARC60M(nn.Module):
 
                 losses["dream_op_kl"] = lambda_aux * aux_op_loss  # Renamed from aux_operation_loss
 
-                # === SYNERGY FUSION KL LOSS (Confidence-Weighted) ===
-                # Teach model to match fused Cortex+RelMem+BrainGraph priors
-                if op_prior_synergy is not None and extras.get("synergy") is not None:
-                    try:
-                        # Compute KL divergence from op_head to fused prior
-                        p_prior = torch.softmax(op_prior_synergy, dim=-1)  # Target distribution
-                        q_model = torch.log_softmax(op_logits, dim=-1)  # Model distribution
-
-                        # KL per example: [B]
-                        kl_per_example = F.kl_div(q_model, p_prior.detach(), reduction='none').sum(-1)
-
-                        # Weight by confidence: high confidence → stronger signal
-                        confidence = extras["synergy"]["confidence"]  # scalar
-                        lambda_kl_synergy = getattr(self.config, 'synergy_fusion_lambda_kl', 1.0)
-
-                        synergy_kl_loss = lambda_kl_synergy * confidence * kl_per_example.mean()
-
-                        losses["synergy_kl"] = synergy_kl_loss
-
-                        if global_step % 100 == 0:
-                            import logging
-                            logging.info(f"[SynergyKL] loss={synergy_kl_loss:.4f}, "
-                                       f"λ={lambda_kl_synergy:.3f}, conf={confidence:.3f}")
-
-                    except Exception as e:
-                        import logging
-                        logging.warning(f"[SynergyKL] Failed to compute loss: {e}")
-
                 if global_step % 100 == 0:
                     import logging
                     logging.info(f"[DreamKL] loss={aux_op_loss:.4f}, Î»={lambda_aux:.3f}, eps={eps:.4f}, "
@@ -4937,8 +4640,8 @@ class TopasARC60M(nn.Module):
 
                         # GPU-FIRST: Ensure concept_proto on same device as brain
                         if self.relmem.concept_proto.device != brain.device:
-                            self.relmem.concept_proto.data = self.relmem.concept_proto.data.to(brain.device)
-                            logging.warning(f"[Device Fix] Moved concept_proto: {self.relmem.concept_proto.device} → {brain.device}")
+                            self.relmem.concept_proto = nn.Parameter(self.relmem.concept_proto.to(brain.device))
+                            logging.warning(f"[Device Fix] RelMem.concept_proto moved to {brain.device}")
 
                         # Handle dimension mismatch using RelMem's trained query_projection
                         proto_dim = self.relmem.concept_proto.shape[-1]
@@ -4972,14 +4675,24 @@ class TopasARC60M(nn.Module):
                         else:
                             brain_projected = brain
 
-                        query_proj = F.normalize(brain_projected, p=2, dim=-1, eps=1e-8)  # [B, D]
-                        # IMPORTANT: prototypes are memory targets; do NOT backprop into them
-                        proto = F.normalize(self.relmem.concept_proto, p=2, dim=-1, eps=1e-8).detach()  # [N, D]
+                        query_proj = F.normalize(brain_projected, p=2, dim=-1)  # [B, D] - NO DETACH
+
+                        # GPU-FIRST: Ensure concept_proto and concept_used are on same device as brain
+                        target_device = brain.device
+                        if self.relmem.concept_proto.device != target_device:
+                            self.relmem.concept_proto = nn.Parameter(self.relmem.concept_proto.to(target_device))
+
+                        # GRADIENT FLOW FIX: Remove detach() to allow gradients to reach concept_proto
+                        proto = F.normalize(self.relmem.concept_proto, p=2, dim=-1)  # [N, D]
 
                         # Select distinct positive/negative concepts
                         active = getattr(self.relmem, 'concept_used', None)
                         pos_idx = neg_idx = None
                         if active is not None and active.numel() >= 2:
+                            # GPU-FIRST: Ensure active indices on correct device
+                            if active.device != target_device:
+                                active = active.to(target_device)
+                                self.relmem.concept_used = active  # Update in place
                             idx = active.nonzero().flatten()
                             # Safety check: ensure idx has at least 2 elements
                             if idx.numel() >= 2:
@@ -5053,95 +4766,6 @@ class TopasARC60M(nn.Module):
                 import logging
                 if global_step % 100 == 0:
                     logging.warning(f"[AuxOp] Non-critical error: {e}")
-
-            # === CAUSAL DISCOVERY TRAINING SIGNALS ===
-            # Add causal understanding losses to improve causal reasoning
-            if self.enable_causal and self.causal_engine is not None and demos and not replay_mode:
-                try:
-                    # Get transformation examples from extras (populated during causal learning)
-                    causal_learning_stats = extras.get('causal_learning_stats', {})
-
-                    # Generate causal training signals if we learned mechanisms
-                    if causal_learning_stats.get('new_causal_links', 0) > 0:
-                        # Prepare transformation examples for signal generation
-                        transformation_examples = []
-                        for demo in demos[:4]:
-                            if isinstance(demo, dict):
-                                demo_in = demo.get('input')
-                                demo_out = demo.get('output')
-                            elif isinstance(demo, (tuple, list)) and len(demo) >= 2:
-                                demo_in, demo_out = demo[0], demo[1]
-                            else:
-                                continue
-
-                            if demo_in is None or demo_out is None:
-                                continue
-
-                            # Ensure batch dimension
-                            if demo_in.dim() == 2:
-                                demo_in = demo_in.unsqueeze(0)
-                            if demo_out.dim() == 2:
-                                demo_out = demo_out.unsqueeze(0)
-
-                            # Encode features
-                            try:
-                                demo_in_enc = demo_in.unsqueeze(1).float() / (self.num_colors - 1)
-                                demo_out_enc = demo_out.unsqueeze(1).float() / (self.num_colors - 1)
-
-                                feat_in, _ = self.encoder(demo_in_enc, hrm_context if 'hrm_context' in locals() else None)
-                                feat_out, _ = self.encoder(demo_out_enc, hrm_context if 'hrm_context' in locals() else None)
-
-                                slots_in_output = self.slots(feat_in)
-                                slots_out_output = self.slots(feat_out)
-
-                                slots_in = slots_in_output[0] if isinstance(slots_in_output, (tuple, list)) else slots_in_output
-                                slots_out = slots_out_output[0] if isinstance(slots_out_output, (tuple, list)) else slots_out_output
-
-                                transformation_examples.append({
-                                    'before': slots_in,
-                                    'after': slots_out
-                                })
-                            except Exception:
-                                continue
-
-                        # Generate training signals from transformation examples
-                        if transformation_examples:
-                            causal_signals = self.causal_engine.generate_causal_training_signals(transformation_examples)
-
-                            # Add causal consistency loss (encourages consistent effect predictions)
-                            if 'causal_consistency_loss' in causal_signals:
-                                lambda_consistency = getattr(self.config, 'lambda_causal_consistency', 0.05)
-                                losses['causal_consistency'] = lambda_consistency * causal_signals['causal_consistency_loss']
-
-                                if global_step % 100 == 0:
-                                    import logging
-                                    logging.info(f"[CausalLoss] consistency={float(causal_signals['causal_consistency_loss']):.4f}, "
-                                               f"λ={lambda_consistency:.3f}")
-
-                            # Add intervention prediction loss (improves counterfactual reasoning)
-                            if 'intervention_prediction_loss' in causal_signals:
-                                lambda_intervention = getattr(self.config, 'lambda_causal_intervention', 0.03)
-                                losses['causal_intervention'] = lambda_intervention * causal_signals['intervention_prediction_loss']
-
-                                if global_step % 100 == 0:
-                                    import logging
-                                    logging.info(f"[CausalLoss] intervention={float(causal_signals['intervention_prediction_loss']):.4f}, "
-                                               f"λ={lambda_intervention:.3f}")
-
-                            # Add counterfactual loss (strengthens causal evidence)
-                            if 'counterfactual_loss' in causal_signals:
-                                lambda_counterfactual = getattr(self.config, 'lambda_causal_counterfactual', 0.02)
-                                losses['causal_counterfactual'] = lambda_counterfactual * causal_signals['counterfactual_loss']
-
-                                if global_step % 100 == 0:
-                                    import logging
-                                    logging.info(f"[CausalLoss] counterfactual={float(causal_signals['counterfactual_loss']):.4f}, "
-                                               f"λ={lambda_counterfactual:.3f}")
-
-                except Exception as e:
-                    import logging
-                    if global_step % 100 == 0:
-                        logging.warning(f"[CausalLoss] Training signal generation failed: {e}")
 
             # === NEW: ENERGY-BASED AUXILIARY LOSSES (φ/κ/CGE/Hodge) ===
             # Compute with grads during pretraining (not just as eval-only priors).
