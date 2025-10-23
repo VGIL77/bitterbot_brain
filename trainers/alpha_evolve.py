@@ -69,6 +69,51 @@ def grid_energy_proxy(grid: torch.Tensor) -> float:
         return float(ent)
     return 1.0
 
+def logits_to_grid_safe(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    ✅ FIX 5: Robust conversion from logits (any dimension) to 2D integer grid.
+
+    Handles:
+    - 4D: [B, C, H, W] → argmax over C → [B, H, W] → squeeze → [H, W]
+    - 3D: [B, H, W] or [H, W, C] → squeeze or argmax → [H, W]
+    - 2D: [H, W] → pass through
+    """
+    import torch
+    import logging
+    logger = logging.getLogger(__name__)
+
+    g = tensor.detach().cpu()
+
+    # 4D: [B, C, H, W] - argmax over channel dim
+    if g.dim() == 4:
+        if g.size(1) == 10:  # Channel dim at index 1
+            g = torch.argmax(g, dim=1)  # [B, H, W]
+        elif g.size(-1) == 10:  # Channel dim at end
+            g = torch.argmax(g, dim=-1)  # [B, H, W]
+        else:
+            logger.warning(f"[logits_to_grid_safe] Unexpected 4D shape: {g.shape}, taking argmax over dim=1")
+            g = torch.argmax(g, dim=1)
+
+    # 3D: Either [B, H, W] or [H, W, C]
+    if g.dim() == 3:
+        if g.size(-1) == 10:  # Channel dim at end
+            g = torch.argmax(g, dim=-1)  # [B, H, W] or [H, W]
+        elif g.size(0) == 1:  # Batch dim at start
+            g = g.squeeze(0)  # [H, W]
+        else:
+            logger.warning(f"[logits_to_grid_safe] Unexpected 3D shape: {g.shape}, using first slice")
+            g = g[0]  # Take first slice
+
+    # 2D: [H, W] - pass through
+    if g.dim() == 2:
+        pass  # Already 2D
+
+    # 1D or higher: error
+    if g.dim() != 2:
+        raise ValueError(f"[logits_to_grid_safe] Cannot convert {g.dim()}D tensor to 2D grid: {g.shape}")
+
+    return g.to(dtype=torch.long)
+
 def select_top2(candidates: List[Dict[str, Any]]) -> List[List[List[int]]]:
     import logging
     logger = logging.getLogger(__name__)
@@ -86,32 +131,17 @@ def select_top2(candidates: List[Dict[str, Any]]) -> List[List[List[int]]]:
         logger.info(f"[select_top2] Candidate {idx}: grid type={type(grid)}, score={c.get('score', 0):.4f}")
 
         if isinstance(grid, torch.Tensor):
-            g = grid.detach().cpu().to(dtype=torch.long)
-            logger.info(f"[select_top2] Tensor grid: shape={tuple(g.shape)}, dim={g.dim()}")
+            logger.info(f"[select_top2] Tensor grid: shape={tuple(grid.shape)}, dim={grid.dim()}")
 
-            # Handle [B,C,H,W] logits (from EBR/PUCT) - Channels at dim=1
-            if g.dim() == 4 and g.size(1) == 10:
-                outs.append(torch.argmax(g, dim=1)[0].tolist())
-                logger.info("[select_top2] Converted 4D logits tensor (B,C,H,W) to 2D list")
-
-            elif g.dim() == 3 and g.size(-1) == 10:
-                outs.append(torch.argmax(g, dim=-1).tolist())
-                logger.info("[select_top2] Converted 3D logits tensor (H,W,10) to 2D list")
-
-            elif g.dim() == 3 and g.size(0) == 1:
-                outs.append(g[0].tolist())
-                logger.info("[select_top2] Converted 3D batch tensor (1,H,W) to 2D list")
-
-            elif g.dim() == 2:
+            # ✅ FIX 5: Use robust conversion helper
+            try:
+                g = logits_to_grid_safe(grid)
                 outs.append(g.tolist())
-                logger.info("[select_top2] Converted 2D tensor (H,W) to list")
+                logger.info(f"[select_top2] Converted {grid.dim()}D tensor to 2D grid: {g.shape}")
+            except ValueError as e:
+                logger.error(f"[select_top2] Failed to convert grid: {e}")
+                raise
 
-            elif g.dim() == 1:
-                # FAIL-FAST: 1D tensor is invalid for ARC grids
-                raise ValueError(f"[select_top2] Invalid 1D tensor shape: {g.shape}. ARC grids must be 2D")
-
-            else:
-                raise ValueError(f"[select_top2] Unhandled tensor shape: {g.shape}")
         elif isinstance(grid, list):
             outs.append(grid)
             logger.info(f"[select_top2] Used list grid directly")

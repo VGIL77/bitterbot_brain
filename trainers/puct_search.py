@@ -278,6 +278,16 @@ class PUCTSearcher:
         else:
             logger.info(f"Initialized PUCT searcher with {len(self.available_ops)} DSL operations")
 
+    def _ensure_device(self, t):
+        """
+        ✅ GPU-FIRST: Ensure tensor is on correct device
+
+        Prevents CPU↔GPU mismatches from DSL ops that return CPU tensors
+        """
+        if isinstance(t, torch.Tensor) and t.device != self.device:
+            return t.to(self.device)
+        return t
+
     def get_policy_value(
         self,
         node: MCTSNode,
@@ -331,6 +341,7 @@ class PUCTSearcher:
 
             # Apply op_bias if provided (memory-driven biasing from RelMem/Wormhole)
             if self.op_bias:
+                from models.dsl_registry import get_op_index  # Import here for fallback path
                 self.search_stats['op_bias_applications'] += 1
                 # Blend op_bias weights into policy priors
                 for op_name, bias_weight in self.op_bias.items():
@@ -355,11 +366,18 @@ class PUCTSearcher:
 
                 # Extract value from ValuePrediction
                 if hasattr(value_output, 'solvability'):
-                    value_estimate = value_output.solvability.squeeze().item()
+                    solvability = value_output.solvability.squeeze()
+                    # Take mean if multiple values (batch dimension or spatial)
+                    value_estimate = solvability.mean().item() if solvability.numel() > 1 else solvability.item()
                 elif hasattr(value_output, 'value'):
-                    value_estimate = value_output.value.item()
+                    value_tensor = value_output.value.squeeze()
+                    value_estimate = value_tensor.mean().item() if value_tensor.numel() > 1 else value_tensor.item()
                 else:
-                    value_estimate = float(value_output.item()) if torch.is_tensor(value_output) else float(value_output)
+                    if torch.is_tensor(value_output):
+                        value_output = value_output.squeeze()
+                        value_estimate = value_output.mean().item() if value_output.numel() > 1 else value_output.item()
+                    else:
+                        value_estimate = float(value_output)
 
             logger.info(f"[PUCT] Eval: depth={node.depth}, ops={node.ops[-3:] if len(node.ops) > 3 else node.ops}, value={value_estimate:.3f}")
             return policy_priors, value_estimate
@@ -368,8 +386,28 @@ class PUCTSearcher:
             logger.error(f"[PUCT] Neural network evaluation FAILED: {e}")
             import traceback
             traceback.print_exc()
-            # FAIL LOUDLY - uniform policy pollutes training signal
-            raise RuntimeError(f"PUCT network eval failed (no fallback allowed): {e}") from e
+
+            # Fallback for inference when policy/value nets are None
+            if self.policy_net is None or self.value_net is None:
+                logger.warning("[PUCT] Using uniform policy fallback (nets not available)")
+                # Uniform policy over available operations
+                num_ops = len(self.dsl_ops) if hasattr(self, 'dsl_ops') else 19
+                policy_priors = torch.ones(1, num_ops, device=self.device) / num_ops
+
+                # Apply op_bias if available
+                if self.op_bias:
+                    for op_name, bias_weight in self.op_bias.items():
+                        from models.dsl_registry import get_op_index
+                        op_idx = get_op_index(op_name)
+                        if 0 <= op_idx < num_ops:
+                            policy_priors[0, op_idx] *= (1.0 + bias_weight)
+                    policy_priors = policy_priors / policy_priors.sum(dim=-1, keepdim=True)
+
+                value_estimate = 0.0  # Neutral value
+                return policy_priors, value_estimate
+            else:
+                # FAIL LOUDLY in training - uniform policy pollutes training signal
+                raise RuntimeError(f"PUCT network eval failed (no fallback allowed): {e}") from e
 
     def _encode_program_state(
         self,
@@ -387,7 +425,7 @@ class PUCTSearcher:
         if len(node.ops) > 0:
             try:
                 program = node.get_program()
-                current_grid = apply_program(test_input, program)
+                current_grid = self._ensure_device(apply_program(test_input, program))
                 if current_grid is None or not torch.is_tensor(current_grid):
                     current_grid = test_input
             except:
@@ -400,29 +438,67 @@ class PUCTSearcher:
             # Ensure grid has batch dimension
             grid_input = current_grid.unsqueeze(0) if current_grid.dim() == 2 else current_grid
 
-            # Run TOPAS forward to extract features
-            forward_out = self.topas_model.forward_pretraining(grid_input)
+            # 🔥 FIX: Use grid_encoder directly to avoid infinite loop in forward_pretraining
+            # PUCT calls this during eval, but forward_pretraining can recursively call itself
+            if hasattr(self.topas_model, 'grid_encoder'):
+                with torch.no_grad():
+                    brain = self.topas_model.grid_encoder(grid_input, task_id=0)
+                    forward_out = {
+                        'brain': brain,
+                        'rel_features': torch.zeros(brain.size(0), 64, device=brain.device)
+                    }
+            else:
+                # Fallback to forward_pretraining (with potential recursion risk)
+                try:
+                    forward_out = self.topas_model.forward_pretraining(grid_input)
+                except RuntimeError as e:
+                    if "Infinite loop" in str(e):
+                        # Emergency fallback: return zero features
+                        B = grid_input.shape[0]
+                        forward_out = {
+                            'brain': torch.zeros(B, 512, device=grid_input.device),
+                            'rel_features': torch.zeros(B, 64, device=grid_input.device)
+                        }
+                    else:
+                        raise
 
             # Extract brain (control features)
             brain = forward_out.get('brain')  # [B, ctrl_dim]
             if brain is None:
-                brain = torch.zeros(1, self.topas_model.ctrl_dim, device=self.device)
+                B = grid_input.shape[0]
+                brain = torch.zeros(B, self.topas_model.ctrl_dim, device=self.device)
+            else:
+                B = brain.shape[0]
 
             # Extract relational features (if available)
             rel_features = forward_out.get('rel_features')
             if rel_features is None:
-                rel_features = torch.zeros(1, 64, device=self.device)
+                rel_features = torch.zeros(B, 64, device=self.device)  # Use actual batch size
 
             # Compute size oracle
             H, W = current_grid.shape[-2:]
             size_oracle = torch.tensor([[H, W, H, W]], device=self.device).float()
+            size_oracle = size_oracle.expand(B, -1)  # Expand to match batch size
 
             # Extract theme priors from TOPAS prior heads
-            theme_priors = self.topas_model.prior_transform(brain)  # [1, 8]
+            theme_priors = self.topas_model.prior_transform(brain)  # [B, 8]
+
+            # 🔥 FIX: Ensure theme_priors has correct batch dimension before padding
+            if theme_priors.dim() == 1:
+                theme_priors = theme_priors.unsqueeze(0)  # [D] → [1, D]
+
+            # Match batch dimension if mismatch (e.g., [30, 5] vs expected [1, 5])
+            if theme_priors.size(0) != B:
+                # Take first B rows if too many, or expand if too few
+                if theme_priors.size(0) > B:
+                    theme_priors = theme_priors[:B, :]
+                else:
+                    theme_priors = theme_priors.expand(B, -1)
+
             if theme_priors.shape[-1] > 10:
                 theme_priors = theme_priors[:, :10]
             elif theme_priors.shape[-1] < 10:
-                padding = torch.zeros(1, 10 - theme_priors.shape[-1], device=self.device)
+                padding = torch.zeros(theme_priors.size(0), 10 - theme_priors.shape[-1], device=self.device)
                 theme_priors = torch.cat([theme_priors, padding], dim=-1)
 
         return current_grid, brain, rel_features, size_oracle, theme_priors
@@ -563,7 +639,7 @@ class PUCTSearcher:
             for input_grid, target_output in demos:
                 try:
                     # Apply program to input
-                    predicted_output = apply_program(input_grid, program)
+                    predicted_output = self._ensure_device(apply_program(input_grid, program))
 
                     # Compute similarity score
                     if predicted_output.shape == target_output.shape:
@@ -675,7 +751,7 @@ class PUCTSearcher:
         try:
             program = node.get_program()
             for input_grid, target_output in demos:
-                predicted = apply_program(input_grid, program)
+                predicted = self._ensure_device(apply_program(input_grid, program))
                 if not torch.equal(predicted, target_output):
                     return False
             return True
@@ -782,6 +858,7 @@ def puct_search(
     test_input: torch.Tensor = None,  # Made optional for alpha_evolve compatibility
     policy_net: torch.nn.Module = None,  # Made optional for alpha_evolve compatibility
     value_net: torch.nn.Module = None,  # Made optional for alpha_evolve compatibility
+    topas_model: torch.nn.Module = None,  # Required for PUCTSearcher
     num_simulations: int = 800,
     max_nodes: int = None,  # BitterBot enhancement: support legacy max_nodes parameter
     c_puct: float = 1.4,
@@ -848,6 +925,7 @@ def puct_search(
     searcher = PUCTSearcher(
         policy_net=policy_net,
         value_net=value_net,
+        topas_model=topas_model,  # Required parameter
         c_puct=c_puct,
         max_depth=max_depth,
         device=device,

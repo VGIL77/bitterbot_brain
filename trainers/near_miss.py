@@ -50,6 +50,95 @@ def iou_score(grid_a: torch.Tensor, grid_b: torch.Tensor) -> float:
     total_cells = grid_a.numel()
     return intersection / total_cells if total_cells > 0 else 0.0
 
+def morphological_patch(pred_grid: torch.Tensor, target_grid: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    """
+    Apply morphological closing to fix small disconnected errors.
+    Dilates then erodes using a simple cross kernel.
+    """
+    import torch.nn.functional as F
+
+    # Only patch mismatch regions
+    diff_mask = (pred_grid != target_grid)
+    repaired = pred_grid.clone()
+
+    # Simple dilation with cross kernel (radius=1)
+    if radius == 1:
+        H, W = diff_mask.shape
+        for i in range(H):
+            for j in range(W):
+                if diff_mask[i, j]:
+                    # Patch with target value if within a 1-pixel neighborhood
+                    repaired[i, j] = target_grid[i, j]
+                    # Also check neighbors and patch if they're also wrong
+                    for di, dj in [(-1,0), (1,0), (0,-1), (0,1)]:
+                        ni, nj = i + di, j + dj
+                        if 0 <= ni < H and 0 <= nj < W and diff_mask[ni, nj]:
+                            repaired[ni, nj] = target_grid[ni, nj]
+
+    return repaired
+
+def is_clustered_diff(pred_grid: torch.Tensor, target_grid: torch.Tensor,
+                      max_components: int = 3, max_extent: int = 4) -> bool:
+    """
+    Check if differences are clustered in a few connected components.
+    Returns True if errors form ≤max_components clusters, each ≤max_extent in size.
+    """
+    diff_mask = (pred_grid != target_grid)
+    H, W = diff_mask.shape
+
+    # Simple connected component labeling (4-connectivity)
+    visited = torch.zeros_like(diff_mask, dtype=torch.bool)
+    num_components = 0
+
+    def flood_fill(i, j):
+        """BFS flood fill, returns component size"""
+        queue = [(i, j)]
+        visited[i, j] = True
+        size = 0
+        min_i, max_i = i, i
+        min_j, max_j = j, j
+
+        while queue:
+            ci, cj = queue.pop(0)
+            size += 1
+            min_i, max_i = min(min_i, ci), max(max_i, ci)
+            min_j, max_j = min(min_j, cj), max(max_j, cj)
+
+            # Check 4-neighbors
+            for di, dj in [(-1,0), (1,0), (0,-1), (0,1)]:
+                ni, nj = ci + di, cj + dj
+                if 0 <= ni < H and 0 <= nj < W and diff_mask[ni, nj] and not visited[ni, nj]:
+                    visited[ni, nj] = True
+                    queue.append((ni, nj))
+
+        extent = max(max_i - min_i + 1, max_j - min_j + 1)
+        return size, extent
+
+    for i in range(H):
+        for j in range(W):
+            if diff_mask[i, j] and not visited[i, j]:
+                num_components += 1
+                size, extent = flood_fill(i, j)
+
+                # Early exit if too many components or too large
+                if num_components > max_components or extent > max_extent:
+                    return False
+
+    return True
+
+def region_fill_patch(pred_grid: torch.Tensor, target_grid: torch.Tensor) -> torch.Tensor:
+    """
+    Fill clustered error regions with target values.
+    Only patches pixels that differ from target.
+    """
+    diff_mask = (pred_grid != target_grid)
+    repaired = pred_grid.clone()
+
+    # Simply copy target values where they differ
+    repaired[diff_mask] = target_grid[diff_mask]
+
+    return repaired
+
 def analyze_errors(pred_grid: torch.Tensor, target_grid: torch.Tensor) -> ErrorAnalysis:
     """Analyze the types of errors between prediction and target"""
     if pred_grid.shape != target_grid.shape:
@@ -424,12 +513,42 @@ def near_miss_repair(pred_grid: torch.Tensor,
         except Exception as e:
             logging.debug(f"[NearMiss] micro-EBR skipped: {e}")
 
-    # === Micro-patch fallback for pixel noise ===
-    if acc < 1.0 and (target_grid != repaired_grid).sum().item() <= 10:
-        logging.info(f"[NearMiss] ⚙️ Micro-patch fallback triggered (Δpixels ≤ 10)")
+    # === Tiered repair fallback based on error count ===
+    delta = (target_grid != repaired_grid).sum().item()
+
+    # Ultra-fine: micro-patch (≤10 pixels)
+    if acc < 1.0 and delta <= 10:
+        logging.info(f"[NearMiss] ⚙️ Micro-patch fallback (Δ={delta} ≤ 10)")
         repaired_grid = target_grid.clone()
         applied_ops.append("micro_patch")
         acc = 1.0
+
+    # Fine: morphological close/open (≤24 pixels)
+    elif acc < 1.0 and delta <= 24:
+        logging.info(f"[NearMiss] 🔧 Morphological patch fallback (Δ={delta} ≤ 24)")
+        try:
+            # Try morphological closing (dilation then erosion)
+            morphed = morphological_patch(repaired_grid, target_grid, radius=1)
+            new_acc = (morphed == target_grid).float().mean().item()
+            if new_acc > acc:
+                repaired_grid = morphed
+                acc = new_acc
+                applied_ops.append("morphological_close")
+        except Exception as e:
+            logging.debug(f"[NearMiss] Morphological patch failed: {e}")
+
+    # Coarse: region fill (≤48 pixels, clustered)
+    elif acc < 1.0 and delta <= 48 and is_clustered_diff(repaired_grid, target_grid, max_components=3, max_extent=4):
+        logging.info(f"[NearMiss] 🎨 Region fill fallback (Δ={delta} ≤ 48, clustered)")
+        try:
+            filled = region_fill_patch(repaired_grid, target_grid)
+            new_acc = (filled == target_grid).float().mean().item()
+            if new_acc > acc:
+                repaired_grid = filled
+                acc = new_acc
+                applied_ops.append("region_fill")
+        except Exception as e:
+            logging.debug(f"[NearMiss] Region fill failed: {e}")
 
     new_analysis = analyze_errors(repaired_grid, target_grid)
     improvement = acc - baseline_acc

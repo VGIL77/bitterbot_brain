@@ -13,6 +13,31 @@ from typing import List, Dict, Optional, Union, Any
 
 logger = logging.getLogger(__name__)
 
+def to_scalar(x, *, reducer="mean"):
+    """
+    ✅ FIX 4: Safe scalar conversion with automatic reduction for multi-element tensors.
+
+    Args:
+        x: Input value (tensor, scalar, or numeric)
+        reducer: Reduction method for multi-element tensors ("mean", "sum", "max", "min")
+
+    Returns:
+        float scalar value
+    """
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return x.item()
+        # Multi-element: reduce first
+        if reducer == "sum":
+            return x.sum().item()
+        elif reducer == "max":
+            return x.max().item()
+        elif reducer == "min":
+            return x.min().item()
+        else:  # "mean" is default
+            return x.mean().item()
+    return float(x)
+
 class DimensionAdapter(nn.Module):
     """Universal tensor compatibility handler for dynamic RelMem operations"""
 
@@ -970,8 +995,8 @@ class RelationalMemoryNeuro(nn.Module):
                 query_norm = F.normalize(query_vec.detach(), p=2, dim=-1)
                 active_protos = F.normalize(self.concept_proto[active_cids], p=2, dim=-1)
 
-                # Ensure active_protos is on correct device
-                active_protos = active_protos.to(self.device)
+                # ✅ FIX 3: Ensure active_protos is on correct device with contiguous layout
+                active_protos = active_protos.to(self.device, non_blocking=True).contiguous()
 
                 # Handle dimension mismatch
                 if query_norm.dim() == 1:
@@ -993,10 +1018,19 @@ class RelationalMemoryNeuro(nn.Module):
 
                     query_norm = self.query_projection(query_norm)
                     query_norm = F.normalize(query_norm, p=2, dim=-1)  # Re-normalize after projection
+
+                # ✅ FIX 3: Ensure query_norm is contiguous and on same device before matmul
+                query_norm = query_norm.to(self.device, non_blocking=True).contiguous()
+                active_protos = active_protos.to(self.device, non_blocking=True).contiguous()
+
                 logging.info(f"[DEBUG] query_norm.shape={query_norm.shape} AFTER projection")
                 logging.info(f"[DEBUG] active_protos.t().shape={active_protos.t().shape}")
 
-                similarities = torch.matmul(query_norm, active_protos.t()).squeeze(0)  # [N_active]
+                # ✅ FIX 3: Device-safe matmul with explicit dtype
+                similarities = torch.matmul(
+                    query_norm.to(dtype=torch.float32),
+                    active_protos.t().to(dtype=torch.float32)
+                ).squeeze(0)  # [N_active]
                 logging.info(f"[DEBUG] similarities.shape={similarities.shape}")
 
                 # Get top-K most similar concepts (NUCLEAR: 128 for maximum context)
@@ -1017,7 +1051,9 @@ class RelationalMemoryNeuro(nn.Module):
                 # Aggregate operation biases from similar concepts (soft aggregation)
                 # Use ALL top-K matches with exponential weighting (no hard threshold)
                 for sim, idx in zip(top_sims, top_indices):
-                    cid = active_cids[idx].item()
+                    # ✅ FIX 4: Use scalar guard for idx
+                    cid = to_scalar(active_cids[idx], reducer="sum")  # idx should be scalar but guard it
+                    cid = int(cid)
                     if cid not in self.concepts:
                         continue
 
@@ -1028,8 +1064,10 @@ class RelationalMemoryNeuro(nn.Module):
                         continue
 
                     # Soft exponential weighting: even weak similarities contribute
-                    # exp(sim * 10) amplifies 0.02 â†’ 1.22, 0.05 â†’ 1.65, 0.1 â†’ 2.72
-                    sim_weight = float(torch.exp(sim * 10).item())
+                    # exp(sim * 10) amplifies 0.02 â†' 1.22, 0.05 â†' 1.65, 0.1 â†' 2.72
+                    # ✅ FIX 4: Use scalar guard for sim (could be multi-element in edge cases)
+                    sim_scalar = to_scalar(sim, reducer="mean")
+                    sim_weight = float(torch.exp(torch.tensor(sim_scalar) * 10).item())
 
                     for op, success in concept_ops.items():
                         op_bias[op] = op_bias.get(op, 0.0) + (success * sim_weight)
