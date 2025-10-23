@@ -27,17 +27,41 @@ logger = logging.getLogger(__name__)
 
 def _nonzero_count(grid: torch.Tensor) -> int:
     """Count non-background pixels"""
-    return int((grid != 0).sum().item())
+    # Handle case where grid might be list or scalar
+    if not isinstance(grid, torch.Tensor):
+        if isinstance(grid, list):
+            grid = torch.tensor(grid)
+        else:
+            return 0
+
+    mask = (grid != 0)
+    if isinstance(mask, bool):
+        return int(mask)
+    return int(mask.sum().item())
 
 
 def _palette(grid: torch.Tensor) -> set:
     """Get set of colors present in grid"""
+    if not isinstance(grid, torch.Tensor):
+        if isinstance(grid, list):
+            grid = torch.tensor(grid)
+        else:
+            return set()
+
     return set(torch.unique(grid).tolist())
 
 
 def _bbox_area(grid: torch.Tensor) -> int:
     """Compute bounding box area of non-background pixels"""
+    if not isinstance(grid, torch.Tensor):
+        if isinstance(grid, list):
+            grid = torch.tensor(grid)
+        else:
+            return 0
+
     mask = (grid != 0)
+    if isinstance(mask, bool):
+        return 0
     if not mask.any():
         return 0
     idx = mask.nonzero(as_tuple=False)
@@ -48,6 +72,10 @@ def _bbox_area(grid: torch.Tensor) -> int:
 
 def _shape(grid: torch.Tensor) -> Tuple[int, int]:
     """Get grid shape"""
+    if not isinstance(grid, torch.Tensor):
+        if isinstance(grid, list):
+            return (len(grid), len(grid[0]) if grid else 0)
+        return (0, 0)
     return tuple(grid.shape[-2:])
 
 

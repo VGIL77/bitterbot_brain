@@ -241,8 +241,9 @@ class _DSLShim:
                 if not params:
                     params = self._default_params(operation, grid)
 
-            program = DSLProgram([(operation, params)])
-            return apply_program(program, grid)
+            # 🔥 FIX: Correct DSLProgram signature and apply_program argument order
+            program = DSLProgram(ops=[operation], params=[params])
+            return apply_program(grid, program)
         except Exception as e:
             import logging
             logging.debug(f"[DSL-Shim] Failed to apply {operation}: {e}")
@@ -3960,22 +3961,20 @@ class TopasARC60M(nn.Module):
         """
         import torch
 
-        # CRITICAL: Re-entrancy guard + loop detector
-        # TTT-specific: prevent recursive self-calls during adaptation
-        if getattr(self, "_in_ttt_forward", False):
-            raise RuntimeError("Re-entrant forward_pretraining call detected during TTT (infinite loop)")
+        # CRITICAL: One-happy-path re-entrancy guard (MUST be first!)
+        if getattr(self, "_in_forward_pretrain", False):
+            raise RuntimeError(f"[TOPAS] Re-entrant forward_pretraining call detected at step={global_step}")
 
-        # Set flag to detect re-entrant calls
-        self._in_ttt_forward = True
-
-        if not hasattr(self, '_forward_call_count'):
-            self._forward_call_count = {}
-            self._forward_last_step = -1
-        if not hasattr(self, '_fp_depth'):
-            self._fp_depth = 0
-
-        self._fp_depth += 1  # Track call depth
+        self._in_forward_pretrain = True
         try:
+            # Initialize tracking counters
+            if not hasattr(self, '_forward_call_count'):
+                self._forward_call_count = {}
+                self._forward_last_step = -1
+            if not hasattr(self, '_fp_depth'):
+                self._fp_depth = 0
+            self._fp_depth = 1  # Set depth for dopamine replay logic
+
             # Reset counter when step changes
             if global_step != self._forward_last_step:
                 self._forward_call_count = {global_step: 1}
@@ -4745,8 +4744,13 @@ class TopasARC60M(nn.Module):
 
                             if global_step % 100 == 0:
                                 import logging
+                                # 🔥 FIX: Ensure scalar conversion with .item() to avoid "5 elements" error
+                                try:
+                                    mean_sim_val = ((sim_matrix * mask).sum() / mask.sum()).item()
+                                except:
+                                    mean_sim_val = 0.0
                                 logging.info(f"[DemoConsist] loss={consistency_loss:.4f} n_demos={len(demo_embeds)} "
-                                           f"mean_sim={float((sim_matrix * mask).sum() / mask.sum()):.3f}")
+                                           f"mean_sim={mean_sim_val:.3f}")
                     except Exception as e:
                         if global_step % 100 == 0:
                             import logging
@@ -5190,10 +5194,10 @@ class TopasARC60M(nn.Module):
     
                 return predictions
         finally:
-            # Always decrement depth on exit
-            self._fp_depth -= 1
-            # Reset re-entrancy flag
-            self._in_ttt_forward = False
+            # Always restore state flags (one-happy-path cleanup)
+            self._in_forward_pretrain = False
+            if hasattr(self, '_fp_depth'):
+                self._fp_depth = 0
 
     # === TTT (Test-Time Training) Methods ===
 

@@ -149,6 +149,9 @@ def explanatory_compression_score(
     cert_violations = 0.0
 
     for pair in demos:  # demos already normalized to strict 2-tuples
+        # FAIL-FAST: Validate demo format
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            raise ValueError(f"[HyLa:152] Invalid demo: expected 2-tuple, got {type(pair)} len={len(pair) if hasattr(pair, '__len__') else 'N/A'}")
         inp, out = pair[0], pair[1]
         try:
             pred = apply_program(inp, program)
@@ -166,6 +169,9 @@ def explanatory_compression_score(
     # Predictive margin: how well does it predict?
     predictive_margin = 0.0
     for pair in demos:  # demos already normalized to strict 2-tuples
+        # FAIL-FAST: Validate demo format
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            raise ValueError(f"[HyLa:169] Invalid demo: expected 2-tuple, got {type(pair)} len={len(pair) if hasattr(pair, '__len__') else 'N/A'}")
         inp, out = pair[0], pair[1]
         try:
             pred = apply_program(inp, program)
@@ -362,6 +368,9 @@ def hyla_one_glance(
         for hyp in hypotheses:
             all_demos_satisfied = True
             for pair in demos:
+                # FAIL-FAST: Validate demo format
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    raise ValueError(f"[HyLa:371] Invalid demo: expected 2-tuple, got {type(pair)} len={len(pair) if hasattr(pair, '__len__') else 'N/A'}")
                 inp, out = pair[0], pair[1]
                 try:
                     pred = apply_program(inp, hyp.sketch)

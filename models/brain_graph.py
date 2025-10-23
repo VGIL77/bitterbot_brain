@@ -513,8 +513,7 @@ class BrainGraph:
         weights = (weights / (weights.sum() + 1e-6)).unsqueeze(-1)  # [K, 1]
         vec = (emb * weights).sum(dim=0, keepdim=False)  # [D]
 
-        # GPU-ONLY: Force CUDA (cardinal rule from CLAUDE.md)
-        return vec.cuda()
+        return vec
 
     def to_dsl_priors(self, concept: str, recalled_attrs: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         """

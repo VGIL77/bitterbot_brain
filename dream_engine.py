@@ -1113,14 +1113,7 @@ class DreamEngine:
         self.nmda.min_batch_size = getattr(self.nmda, "min_batch_size", max(2, int(self.nmda.batch_size/2)))
 
         # Perform NMDA consolidation with curiosity weighting (read-only for micro-ticks)
-        # Micro-ticks are retrieval-only (no backward pass)
-        with torch.no_grad():
-            try:
-                nmda_loss = self.nmda.dream_consolidation(v, a, curiosity_module=self, backprop=False)
-            except Exception as e:
-                import logging
-                logging.warning(f"Dream micro-tick failed: {e}")
-                return 0.0
+        nmda_loss = self.nmda.dream_consolidation(v, a, curiosity_module=self, backprop=False)
 
         # Extract actionable training signals from dream consolidation
         training_signals = self._extract_training_signals(v, a)
@@ -1379,9 +1372,7 @@ class DreamEngine:
 
             # Perform NMDA consolidation with ripple context and curiosity weighting every few steps
             if i % 10 == 0 and self.nmda.is_ready():
-                # Allow NMDA Q-net to learn even if outer context is no_grad()
-                with torch.enable_grad():
-                    loss = self.nmda.dream_consolidation(valence, arousal, self, ripple_ctx=ripple_ctx)
+                loss = self.nmda.dream_consolidation(valence, arousal, self, ripple_ctx=ripple_ctx)
 
         # 1) CIO meta-learn a small step using tokens
         prior = 0.0
@@ -1411,15 +1402,13 @@ class DreamEngine:
         # 5) Several NMDA consolidation passes with ripple context (only when ready)
         losses = []
         if self.nmda.is_ready():
-            # Allow NMDA Q-net to learn even if outer context is no_grad()
-            with torch.enable_grad():
-                for i in range(3):
-                    # Use centralized time advancement
-                    current_ripple_time = self._advance_ripple_time()
-                    ripple_ctx = self.ripple.get_current_context() if self.ripple.is_ripple_active() else None
-                    loss_i = self.nmda.dream_consolidation(valence, arousal, self, ripple_ctx=ripple_ctx)
-                    _ensure(loss_i is not None, "[DreamEngine] nmda consolidation returned None")
-                    losses.append(loss_i)
+            for i in range(3):
+                # Use centralized time advancement
+                current_ripple_time = self._advance_ripple_time()
+                ripple_ctx = self.ripple.get_current_context() if self.ripple.is_ripple_active() else None
+                loss_i = self.nmda.dream_consolidation(valence, arousal, self, ripple_ctx=ripple_ctx)
+                _ensure(loss_i is not None, "[DreamEngine] nmda consolidation returned None")
+                losses.append(loss_i)
         else:
             # NMDA not ready - skip consolidation passes until buffer fills with real data
             losses = [torch.tensor(0.0, device=self.device)]

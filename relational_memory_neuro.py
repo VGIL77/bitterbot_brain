@@ -963,9 +963,15 @@ class RelationalMemoryNeuro(nn.Module):
         if query_vec is not None:
             active_cids = self.concept_used.nonzero().flatten()
             if active_cids.numel() > 0:
+                # 🔥 FIX: Device alignment guard - ensure all tensors on same device
+                query_vec = query_vec.to(self.device)
+
                 # Compute similarities to active concepts
                 query_norm = F.normalize(query_vec.detach(), p=2, dim=-1)
                 active_protos = F.normalize(self.concept_proto[active_cids], p=2, dim=-1)
+
+                # Ensure active_protos is on correct device
+                active_protos = active_protos.to(self.device)
 
                 # Handle dimension mismatch
                 if query_norm.dim() == 1:
@@ -981,6 +987,9 @@ class RelationalMemoryNeuro(nn.Module):
                         nn.init.xavier_uniform_(self.query_projection.weight)
                         self._query_proj_dim = query_norm.shape[-1]
                         logging.info(f"[RelMem] Initialized query_projection: {query_norm.shape[-1]} → {self.D}")
+                    # Ensure projection layer is on correct device
+                    elif self.query_projection.weight.device != self.device:
+                        self.query_projection = self.query_projection.to(self.device)
 
                     query_norm = self.query_projection(query_norm)
                     query_norm = F.normalize(query_norm, p=2, dim=-1)  # Re-normalize after projection

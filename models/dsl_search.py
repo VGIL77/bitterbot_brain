@@ -68,20 +68,20 @@ def _extract_components(grid: torch.Tensor, target_color: int = None) -> List[Di
     """Extract connected components/objects from grid"""
     objects = []
     H, W = grid.shape
-    visited = torch.zeros_like(grid, dtype=torch.bool)
-    
+    visited = torch.zeros_like(grid, dtype=torch.bool, device=grid.device)
+
     # If target_color specified, only extract that color
     colors_to_extract = [target_color] if target_color is not None else torch.unique(grid).tolist()
     colors_to_extract = [c for c in colors_to_extract if c != 0]  # Exclude background
-    
+
     for color in colors_to_extract:
-        color_mask = (grid == color)
-        
+        color_mask = (grid == color).to(grid.device)
+
         for i in range(H):
             for j in range(W):
                 if color_mask[i, j] and not visited[i, j]:
                     # Found new component - extract it
-                    component_mask = torch.zeros_like(grid, dtype=torch.bool)
+                    component_mask = torch.zeros_like(grid, dtype=torch.bool, device=grid.device)
                     stack = [(i, j)]
                     
                     # Flood fill to get all connected pixels
@@ -134,13 +134,14 @@ def _bbox_from_mask(mask: torch.Tensor) -> Tuple[int, int, int, int]:
 
 def _apply_per_object(grid: torch.Tensor, operation: str, params: Dict[str, Any]) -> torch.Tensor:
     """Apply operation to each object in the grid"""
+    original_device = grid.device  # GPU-FIRST: capture device at entry
     objects = _extract_components(grid)
-    result = torch.zeros_like(grid)
-    
+    result = torch.zeros_like(grid, device=grid.device)
+
     for obj in objects:
         obj_grid = obj['grid']
         bbox = obj['bbox']
-        
+
         # Apply operation to this object
         if operation == 'rotate90':
             transformed = torch.rot90(obj_grid, k=-1, dims=(0, 1))
@@ -162,7 +163,11 @@ def _apply_per_object(grid: torch.Tensor, operation: str, params: Dict[str, Any]
             transformed = _translate_grid(obj_grid, dx, dy)
         else:
             transformed = obj_grid  # Default: no change
-        
+
+        # GPU-FIRST: Ensure transformed result stays on original device
+        if isinstance(transformed, torch.Tensor) and transformed.device != original_device:
+            transformed = transformed.to(original_device, non_blocking=True)
+
         # Place transformed object back (handle size changes)
         min_r, min_c, max_r, max_c = bbox
         th, tw = transformed.shape
@@ -181,7 +186,11 @@ def _apply_per_object(grid: torch.Tensor, operation: str, params: Dict[str, Any]
             # Only place non-background pixels
             mask = obj_part != 0
             region[mask] = obj_part[mask]
-    
+
+    # GPU-FIRST: Final device coercion before return
+    if isinstance(result, torch.Tensor) and result.device != original_device:
+        result = result.to(original_device, non_blocking=True)
+
     return result
 
 
@@ -260,9 +269,9 @@ def for_each_object_scale(grid: torch.Tensor, fy: int = 2, fx: int = None) -> to
         # Extend result grid if needed
         new_h = max(result.shape[0], min_r + sh)
         new_w = max(result.shape[1], min_c + sw)
-        
+
         if new_h > result.shape[0] or new_w > result.shape[1]:
-            new_result = torch.zeros(new_h, new_w, dtype=result.dtype)
+            new_result = torch.zeros(new_h, new_w, dtype=result.dtype, device=result.device)
             new_result[:result.shape[0], :result.shape[1]] = result
             result = new_result
         
@@ -295,6 +304,7 @@ def for_each_object(grid: torch.Tensor, operation: str = 'rotate90', **kwargs) -
 
 def apply_program(grid: torch.Tensor, program: DSLProgram) -> torch.Tensor:
     """Apply sequence of DSL operations to a grid."""
+    original_device = grid.device  # Capture input device for GPU-FIRST policy
     out = grid.clone()
     for op, p in zip(program.ops, program.params):
         if op == "identity":
@@ -368,6 +378,17 @@ def apply_program(grid: torch.Tensor, program: DSLProgram) -> torch.Tensor:
             out = for_each_object(out, operation, **{k: v for k, v in p.items() if k != "operation"})
         else:
             continue  # Skip unknown operations
+
+        # ✅ GPU-FIRST: Ensure device consistency after each op
+        if isinstance(out, torch.Tensor) and out.device != original_device:
+            out = out.to(original_device, non_blocking=True)
+
+    # ✅ Final device coercion + contiguous for numerical stability
+    if isinstance(out, torch.Tensor):
+        if out.device != original_device:
+            out = out.to(original_device, non_blocking=True)
+        out = out.contiguous()
+
     return out
 
 
@@ -961,9 +982,9 @@ def count_connected_components(mask: torch.Tensor) -> int:
     """Count connected components in a binary mask"""
     if mask.sum() == 0:
         return 0
-    
+
     H, W = mask.shape
-    visited = torch.zeros_like(mask, dtype=torch.bool)
+    visited = torch.zeros_like(mask, dtype=torch.bool, device=mask.device)
     count = 0
     
     for i in range(H):
