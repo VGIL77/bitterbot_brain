@@ -443,14 +443,3 @@ class CognitiveSynchronizer:
                 "next_transition": self.cycle_length - (global_step % self.cycle_length)
             }
         }
-
-
-# Global orchestrator singleton for cross-module coordination
-_GLOBAL_ORCHESTRATOR = None
-
-def get_global_orchestrator():
-    """Get or create the global cognitive synchronizer instance."""
-    global _GLOBAL_ORCHESTRATOR
-    if _GLOBAL_ORCHESTRATOR is None:
-        _GLOBAL_ORCHESTRATOR = CognitiveSynchronizer()
-    return _GLOBAL_ORCHESTRATOR

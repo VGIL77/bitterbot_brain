@@ -206,6 +206,46 @@ class RelationalMemoryNeuro(nn.Module):
         except Exception:
             return False
 
+    # ✅ FIX 3: Device/dtype-safe matrix multiply for AuxOp and RelMem ops
+    def _mm_same_device_dtype(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Safe matmul ensuring tensors are aligned on device/dtype."""
+        dev = a.device
+        a = a.to(dev, dtype=torch.float32, non_blocking=True).contiguous()
+        b = b.to(dev, dtype=torch.float32, non_blocking=True).contiguous()
+        return a @ b.transpose(-1, -2)
+
+    # ✅ FIX 4: Safe scalar reducer for .item() calls on non-scalar tensors
+    def _to_scalar(self, x, reducer: str = "mean") -> float:
+        """Converts tensors with >1 elements to a scalar safely."""
+        if not torch.is_tensor(x):
+            return float(x)
+        if x.numel() == 1:
+            return x.item()
+        if reducer == "sum":
+            return x.sum().item()
+        if reducer == "max":
+            return x.max().item()
+        if reducer == "min":
+            return x.min().item()
+        return x.mean().item()
+
+    # ✅ FIX: Re-register concept_proto after pruning or checkpoint load
+    def ensure_concept_param(self):
+        """
+        Ensures concept_proto is a proper nn.Parameter on correct device.
+        Call after load_state_dict() or pruning.
+        """
+        if hasattr(self, "concept_proto"):
+            if not isinstance(self.concept_proto, torch.nn.Parameter):
+                tensor = self.concept_proto
+                self.concept_proto = torch.nn.Parameter(
+                    tensor.to(self.device), requires_grad=False
+                )
+                logging.getLogger(__name__).info(
+                    f"[RelMem] concept_proto re-registered as Parameter "
+                    f"({tuple(self.concept_proto.shape)}, device={self.concept_proto.device})"
+                )
+
     def emit_signals(self, ctx=None):
         """Emit structured signals about RelMem rail status"""
         if ctx is not None:
@@ -979,9 +1019,24 @@ class RelationalMemoryNeuro(nn.Module):
 
         op_bias: Dict[str, float] = {}
 
-        # If no active concepts, return **empty** to preserve training purity (no uniform fallback)
+        # If no active concepts, try concept_signals fallback
         if not self.concept_used.any():
-            logging.getLogger(__name__).debug("[RelMem] get_op_bias: no active concepts â†’ SKIP (empty bias)")
+            logging.getLogger(__name__).debug("[RelMem] get_op_bias: no active concepts â†' trying fallback")
+            try:
+                from concept_signals import query_concept_library
+                if query_vec is not None and dsl_ops is not None:
+                    sig = query_concept_library(self, query_vec, dsl_ops, device=self.device, top_k=16)
+                    op_logits = sig.get("op_logits", None)
+                    if torch.is_tensor(op_logits) and op_logits.numel() > 0:
+                        probs = torch.softmax(op_logits[0], dim=-1)
+                        topv, topi = probs.topk(k=min(8, probs.numel()))
+                        for v, i in zip(topv.tolist(), topi.tolist()):
+                            if int(i) < len(dsl_ops):
+                                op_bias[dsl_ops[int(i)]] = float(v)
+                        logging.getLogger(__name__).info(f"[AuxOp] Fallback concept_signals produced {len(op_bias)} priors")
+                        return op_bias
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[AuxOp] Fallback bias failed: {e}")
             return {}
 
         # Retrieve similar concepts using world model
@@ -1019,18 +1074,11 @@ class RelationalMemoryNeuro(nn.Module):
                     query_norm = self.query_projection(query_norm)
                     query_norm = F.normalize(query_norm, p=2, dim=-1)  # Re-normalize after projection
 
-                # ✅ FIX 3: Ensure query_norm is contiguous and on same device before matmul
-                query_norm = query_norm.to(self.device, non_blocking=True).contiguous()
-                active_protos = active_protos.to(self.device, non_blocking=True).contiguous()
-
                 logging.info(f"[DEBUG] query_norm.shape={query_norm.shape} AFTER projection")
-                logging.info(f"[DEBUG] active_protos.t().shape={active_protos.t().shape}")
+                logging.info(f"[DEBUG] active_protos.shape={active_protos.shape}")
 
-                # ✅ FIX 3: Device-safe matmul with explicit dtype
-                similarities = torch.matmul(
-                    query_norm.to(dtype=torch.float32),
-                    active_protos.t().to(dtype=torch.float32)
-                ).squeeze(0)  # [N_active]
+                # ✅ FIX 3: Device-safe matmul using class method
+                similarities = self._mm_same_device_dtype(query_norm, active_protos).squeeze(0)  # [N_active]
                 logging.info(f"[DEBUG] similarities.shape={similarities.shape}")
 
                 # Get top-K most similar concepts (NUCLEAR: 128 for maximum context)
@@ -1051,8 +1099,8 @@ class RelationalMemoryNeuro(nn.Module):
                 # Aggregate operation biases from similar concepts (soft aggregation)
                 # Use ALL top-K matches with exponential weighting (no hard threshold)
                 for sim, idx in zip(top_sims, top_indices):
-                    # ✅ FIX 4: Use scalar guard for idx
-                    cid = to_scalar(active_cids[idx], reducer="sum")  # idx should be scalar but guard it
+                    # ✅ FIX 4: Use class method for scalar guard
+                    cid = self._to_scalar(active_cids[idx], reducer="sum")
                     cid = int(cid)
                     if cid not in self.concepts:
                         continue
@@ -1065,8 +1113,8 @@ class RelationalMemoryNeuro(nn.Module):
 
                     # Soft exponential weighting: even weak similarities contribute
                     # exp(sim * 10) amplifies 0.02 â†' 1.22, 0.05 â†' 1.65, 0.1 â†' 2.72
-                    # ✅ FIX 4: Use scalar guard for sim (could be multi-element in edge cases)
-                    sim_scalar = to_scalar(sim, reducer="mean")
+                    # ✅ FIX 4: Use class method for scalar guard
+                    sim_scalar = self._to_scalar(sim, reducer="mean")
                     sim_weight = float(torch.exp(torch.tensor(sim_scalar) * 10).item())
 
                     for op, success in concept_ops.items():
@@ -1080,8 +1128,24 @@ class RelationalMemoryNeuro(nn.Module):
                         logging.getLogger(__name__).info(f"[RelMem] World model contributed {len(norm)} op biases from {len(top_sims)} concepts")
                         return norm
 
-        # No concepts learned yet â†’ **strict**: return empty to avoid uniform pollution
-        return {}
+        # ✅ Secondary fallback - if empty after thresholding
+        if not op_bias and query_vec is not None and dsl_ops is not None:
+            try:
+                from concept_signals import query_concept_library
+                sig = query_concept_library(self, query_vec, dsl_ops, device=self.device, top_k=16)
+                op_logits = sig.get("op_logits", None)
+                if torch.is_tensor(op_logits) and op_logits.numel() > 0:
+                    probs = torch.softmax(op_logits[0], dim=-1)
+                    topv, topi = probs.topk(k=min(8, probs.numel()))
+                    for v, i in zip(topv.tolist(), topi.tolist()):
+                        if int(i) < len(dsl_ops):
+                            op_bias[dsl_ops[int(i)]] = float(v)
+                    logging.getLogger(__name__).info(f"[AuxOp] Secondary fallback added {len(op_bias)} priors")
+                    return op_bias
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[AuxOp] Secondary fallback failed: {e}")
+
+        return op_bias if op_bias else {}
 
     # === SEMANTIC PATTERN LEARNING METHODS (Experiment 3) ===
 

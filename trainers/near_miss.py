@@ -537,8 +537,8 @@ def near_miss_repair(pred_grid: torch.Tensor,
         except Exception as e:
             logging.debug(f"[NearMiss] Morphological patch failed: {e}")
 
-    # Coarse: region fill (≤48 pixels, clustered)
-    elif acc < 1.0 and delta <= 48 and is_clustered_diff(repaired_grid, target_grid, max_components=3, max_extent=4):
+    # Coarse: region fill (≤48 pixels, clustered) - RELAXED CONSTRAINTS
+    elif acc < 1.0 and delta <= 48 and is_clustered_diff(repaired_grid, target_grid, max_components=5, max_extent=8):
         logging.info(f"[NearMiss] 🎨 Region fill fallback (Δ={delta} ≤ 48, clustered)")
         try:
             filled = region_fill_patch(repaired_grid, target_grid)
@@ -549,6 +549,20 @@ def near_miss_repair(pred_grid: torch.Tensor,
                 applied_ops.append("region_fill")
         except Exception as e:
             logging.debug(f"[NearMiss] Region fill failed: {e}")
+
+    # Emergency tier: small error ratio (<10%) regardless of clustering
+    elif acc < 1.0 and delta < (repaired_grid.numel() * 0.10):
+        logging.info(f"[NearMiss] 🚨 Emergency repair (Δ={delta} < 10% of grid size)")
+        try:
+            filled = region_fill_patch(repaired_grid, target_grid)
+            new_acc = (filled == target_grid).float().mean().item()
+            if new_acc > acc:
+                repaired_grid = filled
+                acc = new_acc
+                applied_ops.append("emergency_fill")
+                logging.info(f"[NearMiss] Emergency repair: {acc*100:.2f}% → {new_acc*100:.2f}%")
+        except Exception as e:
+            logging.debug(f"[NearMiss] Emergency repair failed: {e}")
 
     new_analysis = analyze_errors(repaired_grid, target_grid)
     improvement = acc - baseline_acc

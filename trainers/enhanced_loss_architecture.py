@@ -10,18 +10,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
-from collections import deque, defaultdict
 from enum import Enum
 import math
 import logging
 import time
 
 # Import our human-level enhancement modules
-from trainers.hierarchical_abstraction import HierarchicalAbstractor, AbstractionLevel
-from trainers.causal_discovery import CausalDiscoveryEngine
-from trainers.compositional_learning import CompositionalLearningEngine
-from trainers.meta_learning_integration import MetaLearningOrchestrator
-from trainers.cognitive_sync import get_global_orchestrator
+from hierarchical_abstraction import HierarchicalAbstractor, AbstractionLevel
+from causal_discovery import CausalDiscoveryEngine
+from compositional_learning import CompositionalLearningEngine
+from meta_learning_integration import MetaLearningOrchestrator
+from cognitive_sync import get_global_orchestrator
 
 class LossComponent(Enum):
     """Types of loss components in the enhanced architecture"""

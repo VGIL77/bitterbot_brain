@@ -410,34 +410,12 @@ class MultiHeadPretrainer(nn.Module):
         if 'program_tokens' in targets:
             program_pred = predictions['program_tokens']  # [B, max_length, vocab_size]
             program_target = targets['program_tokens']    # [B, max_length]
-
+            
             # Flatten for cross-entropy
-            B, L_pred, V = program_pred.shape
-
-            # Ensure program_target has correct shape
-            if program_target.dim() == 1:
-                # If flat, infer target length from total size
-                total_size = program_target.numel()
-                L_tgt = total_size // B
-                program_target = program_target.view(B, L_tgt)
-            elif program_target.dim() == 2:
-                L_tgt = program_target.size(1)
-            else:
-                raise ValueError(f"Unexpected program_target shape: {program_target.shape}")
-
-            # If lengths don't match, align them
-            if L_tgt != L_pred:
-                if L_tgt > L_pred:
-                    # Truncate target to match pred length
-                    program_target = program_target[:, :L_pred]
-                else:
-                    # Pad target with zeros
-                    program_target = F.pad(program_target, (0, L_pred - L_tgt), value=0)
-
-            # Now flatten both (they have matching length L_pred)
+            B, L, V = program_pred.shape
             program_loss = F.cross_entropy(
-                program_pred.reshape(B * L_pred, V),
-                program_target.reshape(B * L_pred).long().clamp(0, V - 1)
+                program_pred.view(B * L, V),
+                program_target.view(B * L).long().clamp(0, V - 1)
             )
             loss_components['program'] = program_loss
         else:
@@ -600,17 +578,7 @@ class MultiHeadPretrainer(nn.Module):
             param_priors: Dict mapping parameter names to prior tensors (ALL ON GPU!)
         """
         param_priors = {}
-
-        # Get device from first available tensor in predictions (robust to missing keys)
-        device = None
-        for value in predictions.values():
-            if torch.is_tensor(value):
-                device = value.device
-                break
-
-        if device is None:
-            # Fallback to cuda if no tensors found
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = predictions['grid'].device
 
         # === Extract from size_class head ===
         if 'size_class' in predictions:
