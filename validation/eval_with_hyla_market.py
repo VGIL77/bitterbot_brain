@@ -384,6 +384,10 @@ def run_evaluation(checkpoint_path, output_file='submission.json', device='cuda'
     for idx in tqdm(task_range, desc="Evaluating"):
         task_id = f'task_{idx}'  # Initialize early for error handling
         try:
+            # ✅ FIX: Reset forward_pretraining call counter to prevent loop detection across tasks
+            if hasattr(model, '_forward_call_count'):
+                model._forward_call_count = {}
+
             # Get task - dataset returns tuple (demos, test_inputs, test_outputs, task_id)
             demos, test_inputs, test_outputs, task_id = dataset[idx]
 

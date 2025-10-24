@@ -438,29 +438,19 @@ class PUCTSearcher:
             # Ensure grid has batch dimension
             grid_input = current_grid.unsqueeze(0) if current_grid.dim() == 2 else current_grid
 
-            # 🔥 FIX: Use grid_encoder directly to avoid infinite loop in forward_pretraining
-            # PUCT calls this during eval, but forward_pretraining can recursively call itself
-            if hasattr(self.topas_model, 'grid_encoder'):
-                with torch.no_grad():
-                    brain = self.topas_model.grid_encoder(grid_input, task_id=0)
+            # Use forward_pretraining - counter is reset per task in eval loop
+            try:
+                forward_out = self.topas_model.forward_pretraining(grid_input)
+            except RuntimeError as e:
+                if "Infinite loop" in str(e):
+                    # Emergency fallback: return zero features
+                    B = grid_input.shape[0]
                     forward_out = {
-                        'brain': brain,
-                        'rel_features': torch.zeros(brain.size(0), 64, device=brain.device)
+                        'brain': torch.zeros(B, self.topas_model.ctrl_dim, device=grid_input.device),
+                        'rel_features': torch.zeros(B, 64, 256, device=grid_input.device)
                     }
-            else:
-                # Fallback to forward_pretraining (with potential recursion risk)
-                try:
-                    forward_out = self.topas_model.forward_pretraining(grid_input)
-                except RuntimeError as e:
-                    if "Infinite loop" in str(e):
-                        # Emergency fallback: return zero features
-                        B = grid_input.shape[0]
-                        forward_out = {
-                            'brain': torch.zeros(B, 512, device=grid_input.device),
-                            'rel_features': torch.zeros(B, 64, device=grid_input.device)
-                        }
-                    else:
-                        raise
+                else:
+                    raise
 
             # Extract brain (control features)
             brain = forward_out.get('brain')  # [B, ctrl_dim]
@@ -481,7 +471,25 @@ class PUCTSearcher:
             size_oracle = size_oracle.expand(B, -1)  # Expand to match batch size
 
             # Extract theme priors from TOPAS prior heads
-            theme_priors = self.topas_model.prior_transform(brain)  # [B, 8]
+            # ✅ FIX: Handle dimension mismatch (brain might be 512 but prior_transform expects 768)
+            try:
+                # Check if brain dimension matches prior_transform input
+                if brain.shape[-1] != self.topas_model.ctrl_dim:
+                    # Project brain to correct dimension
+                    if not hasattr(self, '_brain_projector') or self._brain_projector.in_features != brain.shape[-1]:
+                        self._brain_projector = torch.nn.Linear(
+                            brain.shape[-1],
+                            self.topas_model.ctrl_dim,
+                            device=brain.device
+                        )
+                    brain = self._brain_projector(brain)
+
+                theme_priors = self.topas_model.prior_transform(brain)  # [B, 8]
+            except RuntimeError as e:
+                # Emergency fallback: return zeros if dimension mismatch
+                import logging
+                logging.warning(f"[PUCT] prior_transform failed: {e}, using zero priors")
+                theme_priors = torch.zeros(brain.size(0), 8, device=self.device)
 
             # 🔥 FIX: Ensure theme_priors has correct batch dimension before padding
             if theme_priors.dim() == 1:

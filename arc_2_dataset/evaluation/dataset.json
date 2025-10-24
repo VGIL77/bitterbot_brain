@@ -1,0 +1,8 @@
+{
+  "vocab_size": 10,
+  "seq_len": 512,
+  "num_puzzle_identifiers": 120,
+  "total_groups": 120,
+  "mean_puzzle_examples": 1.0,
+  "sets": ["train", "test"]
+}
